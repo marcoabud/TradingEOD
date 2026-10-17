@@ -1,0 +1,68 @@
+name: Daily EOD Trading
+
+on:
+  schedule:
+    # Normal 16:00 New York close: 15:45 EDT / EST respectively.
+    - cron: '45 19 * * 1-5'
+    - cron: '45 20 * * 1-5'
+    # Early 13:00 close: 12:45 EDT / EST. Calendar guard rejects other days.
+    - cron: '45 16 * * 1-5'
+    - cron: '45 17 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Simulate the plan without submitting orders'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+# One account must have one deployment/repository. Never cancel a running trader.
+concurrency:
+  group: alpaca-eod-account
+  cancel-in-progress: false
+
+jobs:
+  trading:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      # A daily claim on the eod-state branch prevents repeat order submissions.
+      contents: write
+    env:
+      PYTHONUNBUFFERED: '1'
+      GITHUB_TOKEN: ${{ github.token }}
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      ALPACA_PAPER: ${{ secrets.ALPACA_PAPER }}
+      ALPACA_DATA_FEED: ${{ vars.ALPACA_DATA_FEED || 'sip' }}
+      WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      # Missing TRADING_ENABLED means schedules remain read-only simulations.
+      DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) || (github.event_name != 'workflow_dispatch' && vars.TRADING_ENABLED != 'true') }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Evaluate session and execute EOD plan
+        run: python -m src.bot
+      - name: Preserve execution summary
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: eod-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: run_summary.json
+          if-no-files-found: warn
+          retention-days: 30
