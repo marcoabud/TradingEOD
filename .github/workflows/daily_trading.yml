@@ -40,7 +40,7 @@ jobs:
       ALPACA_PAPER: ${{ secrets.ALPACA_PAPER }}
       ALPACA_DATA_FEED: ${{ vars.ALPACA_DATA_FEED || 'sip' }}
       WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_TRADINGEOD || secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       # Missing TRADING_ENABLED means schedules remain read-only simulations.
       DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) || (github.event_name != 'workflow_dispatch' && vars.TRADING_ENABLED != 'true') }}
