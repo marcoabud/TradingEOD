@@ -1,0 +1,58 @@
+name: Test Telegram
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  telegram-test:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      PYTHONUNBUFFERED: '1'
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_TRADINGEOD || secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Send a clearly identified Telegram test
+        run: |
+          python - <<'PY'
+          import os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          from src.notifier import notify
+
+          telegram_env = {
+              key: os.environ.get(key, '').strip()
+              for key in ('TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID')
+          }
+          if not all(telegram_env.values()):
+              raise SystemExit('Missing Telegram token or TELEGRAM_CHAT_ID; configure Repository Secrets.')
+
+          result = notify({
+              'status': 'telegram_test',
+              'session_date': datetime.now(ZoneInfo('America/Mexico_City')).date().isoformat(),
+              'mode': 'notification_test',
+              'regime': 'NOT_EVALUATED',
+              'equity': 'No consultado',
+              'pnl_day': 'No consultado',
+              'orders': [],
+              'reason': 'PRUEBA MANUAL DE TELEGRAM. No se consultó Alpaca ni se enviaron órdenes.',
+          }, environ=telegram_env)
+          if result.get('telegram') is not True:
+              raise SystemExit('Telegram did not confirm delivery; inspect the notification warnings.')
+          print('Telegram test delivery confirmed.')
+          PY
