@@ -1,0 +1,6 @@
+-c constraints.txt
+alpaca-py==0.44.0
+pandas==3.0.6
+numpy==2.5.4
+requests==2.34.2
+pytz==2026.5
