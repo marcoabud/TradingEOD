@@ -17,6 +17,7 @@ Motor EOD de Alpaca para una cuenta dedicada de aproximadamente USD 4,000. Lee e
 | `src/state.py` | Registro persistente por cuenta, fecha de Nueva York y modo |
 | `src/notifier.py` | Webhook JSON y Telegram opcionales |
 | `.github/workflows/daily_trading.yml` | Ejecución programada y manual |
+| `.github/workflows/test_telegram.yml` | Prueba manual de Telegram sin acceso a Alpaca |
 | `.github/workflows/ci.yml` | Pruebas sin credenciales ni acceso al broker |
 | `tests/` | Pruebas de indicadores, ejecución, estado, calendario y notificaciones |
 | `setup_and_push.sh` | Instalador autocontenido y publicación Git sin force-push |
@@ -46,7 +47,7 @@ Configúralos en [TradingEOD → Settings → Secrets and variables → Actions]
 | `ALPACA_PAPER` | `true` para paper; `false` para live. Vacío usa `true`; otro texto se rechaza |
 | `WEBHOOK_URL` | URL HTTPS de n8n u otro receptor JSON; omitir si no quieres webhook |
 
-Telegram directo es opcional: agrega **`TELEGRAM_BOT_TOKEN`** y **`TELEGRAM_CHAT_ID`** como secrets. No pongas una URL de Telegram en `WEBHOOK_URL`: cada canal tiene su formato propio. No incluyas secretos en `.env.example`, commits, logs o mensajes.
+Telegram directo es opcional: guarda el token del bot en **`TELEGRAM_TRADINGEOD`** y el destino en **`TELEGRAM_CHAT_ID`**, ambos como Repository Secrets. Los workflows aceptan también **`TELEGRAM_BOT_TOKEN`** como nombre alternativo del secret; si existen ambos tokens, se usa `TELEGRAM_TRADINGEOD`. Dentro del proceso Python el nombre del entorno sigue siendo `TELEGRAM_BOT_TOKEN`; para una ejecución local utiliza ese nombre. No pongas una URL de Telegram en `WEBHOOK_URL`: cada canal tiene su formato propio y Telegram directo no requiere webhook. No incluyas secretos en `.env.example`, commits, logs o mensajes.
 
 Variables de repositorio (pestaña **Variables**, no Secrets):
 
@@ -56,6 +57,12 @@ Variables de repositorio (pestaña **Variables**, no Secrets):
 | `ALPACA_DATA_FEED` | `sip` por defecto; requiere acceso a datos SIP recientes. `iex` permite el feed IEX si está habilitado en tu cuenta |
 
 El acceso a SIP es independiente de usar una cuenta paper. No hay cambio silencioso a datos IEX: son una cobertura de mercado distinta y pueden cambiar las señales. Si el feed elegido falla, la ejecución se bloquea antes de negociar.
+
+### Prueba manual de Telegram
+
+Con el token y `TELEGRAM_CHAT_ID` configurados, abre **Actions → Test Telegram → Run workflow**, selecciona `main` y ejecuta la prueba. Puede hacerse a cualquier hora, incluidos fines de semana y feriados: no consulta el calendario de mercado, no utiliza credenciales Alpaca y no ejecuta el motor de trading.
+
+El mensaje indica **PRUEBA MANUAL DE TELEGRAM**, estado `telegram_test` y modo `notification_test`. Equity y P&L aparecen como «No consultado». El workflow solo termina correctamente si Telegram confirma la entrega; falla si falta alguno de los dos secretos o el envío no se confirma. No envía un webhook ni activa las ejecuciones de trading. Esta prueba comprueba el canal de avisos; no valida señales ni órdenes.
 
 ### Puesta en servicio
 
