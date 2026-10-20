@@ -18,6 +18,7 @@ htmlcov/
 
 # Runtime output may include private account balances.
 run_summary.json
+connectivity_summary.json
 *.log
 .eod.lock
 .DS_Store

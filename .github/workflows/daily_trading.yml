@@ -2,6 +2,12 @@ name: Daily EOD Trading
 
 on:
   schedule:
+    # Start early and wait on Alpaca's clock. Distinct rows identify the DST family.
+    - cron: '17 14 * * 1-5'
+    - cron: '17 15 * * 1-5'
+    # Warm starts for 13:00 ET early closes only.
+    - cron: '17 11 * * 1-5'
+    - cron: '17 12 * * 1-5'
     # Normal 16:00 New York close: 15:45 EDT / EST respectively.
     - cron: '45 19 * * 1-5'
     - cron: '45 20 * * 1-5'
@@ -15,6 +21,11 @@ on:
         required: true
         default: true
         type: boolean
+      wait_for_window:
+        description: 'Wait for the permitted window today (maximum 330 minutes)'
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -23,17 +34,20 @@ permissions:
 concurrency:
   group: alpaca-eod-account
   cancel-in-progress: false
+  queue: max
 
 jobs:
   trading:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 360
     permissions:
       # A daily claim on the eod-state branch prevents repeat order submissions.
       contents: write
     env:
       PYTHONUNBUFFERED: '1'
+      EOD_SCHEDULED_CRON: ${{ github.event.schedule || '' }}
+      EOD_WAIT_FOR_WINDOW: ${{ github.event_name == 'schedule' || inputs.wait_for_window }}
       GITHUB_TOKEN: ${{ github.token }}
       ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}

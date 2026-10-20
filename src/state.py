@@ -9,8 +9,9 @@ GitHub Actions stores immutable markers on the dedicated ``eod-state`` branch.
 The contents API's create-without-SHA operation is the atomic claim; the workflow
 token needs ``contents: write``.  Local runs require an absolute ``EOD_STATE_DIR``
 and use exclusive file creation.  Local state coordinates only processes sharing
-that directory and does not coordinate with GitHub or another machine.  Dry runs
-must not call this module.
+that directory and does not coordinate with GitHub or another machine. Dry runs
+must not claim trading sessions. Missed-window notification claims use their own
+namespace and never consume or overwrite a trading-session marker.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ REQUEST_TIMEOUT = (5, 20)
 
 
 class StateError(RuntimeError):
-    """The persistent execution claim could not be established safely."""
+    """A persistent execution or notification claim could not be established safely."""
 
 
 def _validated_inputs(account_id: object, session_date: date | str, paper: bool) -> tuple[str, str, str]:
@@ -58,9 +59,22 @@ def _error(operation: str, status: int | None = None) -> StateError:
     return StateError(f"Persistent state {operation} failed{suffix}")
 
 
-def _claim_local(state_dir: str, marker_path: str, payload: bytes) -> bool:
+def _claim_local(
+    state_dir: str, marker_path: str, payload: bytes, *,
+    suppress_if_exists: str | None = None,
+) -> bool:
     if not state_dir or not Path(state_dir).is_absolute():
         raise StateError("Local execution requires an absolute EOD_STATE_DIR")
+    if suppress_if_exists is not None:
+        try:
+            (Path(state_dir) / suppress_if_exists).stat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # An unreadable execution marker never means the session was missed.
+            raise _error("local suppression lookup") from None
+        else:
+            return False
     marker = Path(state_dir) / marker_path
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -83,7 +97,8 @@ def _claim_local(state_dir: str, marker_path: str, payload: bytes) -> bool:
 
 def _claim_github(
     environ: Mapping[str, str], marker_path: str, payload: bytes, day: str, mode: str,
-    session: requests.Session,
+    session: requests.Session, *, suppress_if_exists: str | None = None,
+    claim_label: str = "session",
 ) -> bool:
     repository = environ.get("GITHUB_REPOSITORY", "")
     revision = environ.get("GITHUB_SHA", "")
@@ -119,8 +134,8 @@ def _claim_github(
             return False
         raise _error("branch lookup", response.status_code)
 
-    def marker_exists() -> bool:
-        response = request("GET", f"contents/{marker_path}", params={"ref": STATE_BRANCH})
+    def marker_exists(path: str = marker_path) -> bool:
+        response = request("GET", f"contents/{path}", params={"ref": STATE_BRANCH})
         if response.status_code == 200:
             return True
         if response.status_code == 404:
@@ -140,17 +155,19 @@ def _claim_github(
                 if not branch_exists():
                     raise _error("branch creation", created.status_code)
 
+    if suppress_if_exists is not None and marker_exists(suppress_if_exists):
+        return False
     if marker_exists():
         return False
     body = {
-        "message": f"Claim EOD session {day} ({mode})",
+        "message": f"Claim EOD {claim_label} {day} ({mode})",
         "content": base64.b64encode(payload).decode("ascii"),
         "branch": STATE_BRANCH,
     }
     try:
         claimed = request("PUT", f"contents/{marker_path}", json=body)
     except StateError:
-        # Even if this process may own the marker, uncertainty must skip trading.
+        # Even if this process may own the marker, uncertainty grants no action.
         if marker_exists():
             return False
         raise
@@ -161,6 +178,31 @@ def _claim_github(
     if marker_exists():
         return False
     raise _error("marker creation", claimed.status_code)
+
+
+def _claim_marker(
+    environ: Mapping[str, str], session: requests.Session | None,
+    marker_path: str, payload: bytes, day: str, mode: str, *,
+    suppress_if_exists: str | None = None, claim_label: str = "session",
+) -> bool:
+    github_actions = environ.get("GITHUB_ACTIONS", "").lower()
+    if github_actions not in ("", "false", "true"):
+        raise StateError("Invalid GITHUB_ACTIONS environment flag")
+    if github_actions != "true":
+        return _claim_local(
+            environ.get("EOD_STATE_DIR", ""), marker_path, payload,
+            suppress_if_exists=suppress_if_exists,
+        )
+    if session is not None:
+        return _claim_github(
+            environ, marker_path, payload, day, mode, session,
+            suppress_if_exists=suppress_if_exists, claim_label=claim_label,
+        )
+    with requests.Session() as managed_session:
+        return _claim_github(
+            environ, marker_path, payload, day, mode, managed_session,
+            suppress_if_exists=suppress_if_exists, claim_label=claim_label,
+        )
 
 
 def claim_session(
@@ -180,12 +222,32 @@ def claim_session(
     account_hash, day, mode = _validated_inputs(account_id, session_date, paper)
     marker_path = f"sessions/{mode}/{account_hash}/{day}.json"
     payload = (json.dumps({"session_date": day, "mode": mode}, sort_keys=True) + "\n").encode("utf-8")
-    github_actions = environ.get("GITHUB_ACTIONS", "").lower()
-    if github_actions not in ("", "false", "true"):
-        raise StateError("Invalid GITHUB_ACTIONS environment flag")
-    if github_actions != "true":
-        return _claim_local(environ.get("EOD_STATE_DIR", ""), marker_path, payload)
-    if session is not None:
-        return _claim_github(environ, marker_path, payload, day, mode, session)
-    with requests.Session() as managed_session:
-        return _claim_github(environ, marker_path, payload, day, mode, managed_session)
+    return _claim_marker(environ, session, marker_path, payload, day, mode)
+
+
+def claim_missed_window(
+    account_id: object,
+    session_date: date | str,
+    paper: bool,
+    *,
+    environ: Mapping[str, str] = os.environ,
+    session: requests.Session | None = None,
+) -> bool:
+    """Reserve one missed-window alert without claiming the trading session.
+
+    An existing execution marker suppresses the alert, even if that execution
+    failed after claiming its session. Only a new notification marker returns
+    True. The marker is written BEFORE sending and is retained if delivery fails:
+    this is best-effort notification, with no guaranteed retry on a later run.
+    Callers must still enforce calendar/window checks; this grants no orders.
+    """
+    account_hash, day, mode = _validated_inputs(account_id, session_date, paper)
+    execution_path = f"sessions/{mode}/{account_hash}/{day}.json"
+    notice_path = f"notifications/missed-window/{mode}/{account_hash}/{day}.json"
+    payload = (json.dumps(
+        {"session_date": day, "mode": mode, "event": "missed_window"}, sort_keys=True,
+    ) + "\n").encode("utf-8")
+    return _claim_marker(
+        environ, session, notice_path, payload, day, mode,
+        suppress_if_exists=execution_path, claim_label="missed-window notification",
+    )

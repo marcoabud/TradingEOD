@@ -14,7 +14,8 @@ from .data import MarketData
 from .notifier import notify
 from .safety import (NY, SafetyError, aware, decimal, money, quantity,
                      resolve_window, usable_cash, validate_account)
-from .state import StateError, claim_session
+from .scheduling import prepare_start
+from .state import StateError, claim_missed_window, claim_session
 from .strategy import (DEFENSIVE_SYMBOL, OFFENSIVE_UNIVERSE, SWING_UNIVERSE,
                        StrategyDataError, core_targets, swing_entries, swing_exits)
 
@@ -143,9 +144,13 @@ def run(config, broker, data, summary, claim=claim_session):
                    dry_run=config.dry_run, feed=config.feed, orders=[], planned_orders=[],
                    protected=[], regime="NOT_EVALUATED", status="skipped")
     if window is None:
+        if summary.get("prestart_approved"):
+            raise SafetyError("Market session became unavailable after prestart approval; no orders submitted")
         summary["reason"] = "Market closed or no session today"
         return
     if not window.accepts_start(clock.timestamp):
+        if summary.get("prestart_approved"):
+            raise SafetyError("Start window expired after prestart approval; no orders submitted")
         summary["reason"] = "Outside calendar close-minus-15-minute start window (5-minute grace)"
         return
     account = broker.account()
@@ -247,8 +252,35 @@ def main():
     code = 0
     try:
         config = Config.from_env()
-        run(config, Broker(config.key, config.secret, config.paper),
-            MarketData(config.key, config.secret, config.feed), summary)
+        summary.update(mode="paper" if config.paper else "live", dry_run=config.dry_run,
+                       data_feed=config.feed, regime="NOT_EVALUATED")
+        broker = Broker(config.key, config.secret, config.paper)
+        outcome = prepare_start(
+            broker, summary, event_name=os.environ.get("GITHUB_EVENT_NAME", ""),
+            scheduled_cron=os.environ.get("EOD_SCHEDULED_CRON", ""),
+            wait_for_window=bool_env(os.environ, "EOD_WAIT_FOR_WINDOW", False),
+        )
+        if outcome == "ready":
+            summary["prestart_approved"] = True
+            run(config, broker, MarketData(config.key, config.secret, config.feed), summary)
+        elif outcome == "missed_window" and config.dry_run:
+            summary.update(status="skipped", reason="Late simulation; no trading or alert marker consumed")
+        elif outcome == "missed_window":
+            account = broker.account()  # Read-only identity for the separate alert marker.
+            if claim_missed_window(account.id, summary["session_date"], config.paper):
+                summary.update(
+                    status="missed_window",
+                    reason=("Se perdió la ventana EOD: inicio permitido desde "
+                            f"{summary['target_time']} hasta antes de {summary['start_deadline']}; "
+                            f"ejecución recibida {summary['observed_at']}. "
+                            "No existe un registro de intento de trading para esta sesión. "
+                            "Esta ejecución no envió órdenes."),
+                )
+                code = 1
+            else:
+                summary.update(status="skipped", reason="Session already claimed or missed-window alert already reserved")
+        elif outcome != "skipped":
+            raise SafetyError("Unexpected calendar prestart result")
     except (SafetyError, StrategyDataError, StateError) as exc:
         # These are controlled messages; upstream HTTP exception strings can contain secrets.
         summary.update(status="blocked", reason=str(exc))
@@ -263,9 +295,18 @@ def main():
         # Save before notifying so notification failures cannot erase execution evidence.
         Path("run_summary.json").write_text(json.dumps(serializable, indent=2, ensure_ascii=False), encoding="utf-8")
         LOG.info("Result: %s | %s", summary["status"], summary.get("reason", ""))
-        # Avoid four duplicate holiday/off-window messages from the four cron slots.
+        # Alternative cron families and holidays stay quiet; a missed eligible
+        # session alerts once through a marker separate from the trading claim.
         if summary["status"] != "skipped":
-            notify(serializable)
+            try:
+                delivery = notify(serializable)
+            except Exception:
+                delivery = {"internal_error": False}
+            serializable["notification_delivery"] = delivery
+            if any(value is not True for value in delivery.values()):
+                LOG.error("Notification delivery was not confirmed; execution will not be retried")
+                code = 1
+            Path("run_summary.json").write_text(json.dumps(serializable, indent=2, ensure_ascii=False), encoding="utf-8")
     return code
 
 

@@ -8,10 +8,11 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import requests
 
-from src.state import claim_session, StateError
+from src.state import claim_missed_window, claim_session, StateError
 
 
 ACCOUNT = "test-account-not-a-credential"
@@ -161,6 +162,164 @@ class StateTests(unittest.TestCase):
                                     (ACCOUNT, DAY, "false")):
             with self.subTest(account=account, day=day, paper=paper), self.assertRaises(StateError):
                 claim_session(account, day, paper, environ=ENV, session=FakeSession([]))
+
+
+class MissedWindowStateTests(unittest.TestCase):
+    def test_local_notice_deduplicates_without_consuming_trading_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = {"EOD_STATE_DIR": directory}
+            self.assertTrue(claim_missed_window(ACCOUNT, DAY, True, environ=env))
+            self.assertFalse(claim_missed_window(ACCOUNT, DAY, True, environ=env))
+            self.assertFalse((Path(directory) / "sessions").exists())
+            notices = list((Path(directory) / "notifications").rglob("*.json"))
+            self.assertEqual(len(notices), 1)
+            self.assertIn("missed-window", notices[0].parts)
+            self.assertEqual(json.loads(notices[0].read_text()), {
+                "event": "missed_window", "mode": "paper", "session_date": "2026-10-16",
+            })
+            self.assertNotIn(ACCOUNT, str(notices[0]))
+            self.assertNotIn(ACCOUNT, notices[0].read_text())
+            self.assertTrue(claim_session(ACCOUNT, DAY, True, environ=env))
+            self.assertFalse(claim_missed_window(ACCOUNT, DAY, True, environ=env))
+
+    def test_local_existing_trading_claim_suppresses_without_creating_notice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = {"EOD_STATE_DIR": directory}
+            self.assertTrue(claim_session(ACCOUNT, DAY, True, environ=env))
+            self.assertFalse(claim_missed_window(ACCOUNT, DAY, True, environ=env))
+            self.assertFalse((Path(directory) / "notifications").exists())
+
+    def test_local_notices_are_partitioned_by_account_date_and_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = {"EOD_STATE_DIR": directory}
+            for account, day, paper in (
+                (ACCOUNT, DAY, True), (ACCOUNT, DAY, False),
+                ("another-account", DAY, True), (ACCOUNT, date(2026, 10, 19), True),
+            ):
+                self.assertTrue(claim_missed_window(account, day, paper, environ=env))
+            self.assertEqual(len(list(Path(directory).rglob("*.json"))), 4)
+
+    def test_concurrent_local_notices_allow_only_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = {"EOD_STATE_DIR": directory}
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(
+                    lambda _: claim_missed_window(ACCOUNT, DAY, True, environ=env), range(20),
+                ))
+            self.assertEqual(sum(results), 1)
+            self.assertFalse((Path(directory) / "sessions").exists())
+
+    def test_local_notice_requires_absolute_state_directory(self):
+        for env in ({}, {"EOD_STATE_DIR": "relative/path"}):
+            with self.subTest(env=env), self.assertRaises(StateError):
+                claim_missed_window(ACCOUNT, DAY, True, environ=env)
+
+    def test_local_suppression_read_failure_cannot_reserve_notice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("src.state.Path.stat", side_effect=PermissionError("private detail")):
+                with self.assertRaisesRegex(StateError, "local suppression lookup") as raised:
+                    claim_missed_window(ACCOUNT, DAY, True, environ={"EOD_STATE_DIR": directory})
+            self.assertNotIn("private detail", str(raised.exception))
+            self.assertEqual(list(Path(directory).rglob("*.json")), [])
+
+    def test_local_notice_creation_failure_is_sanitized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("src.state.os.open", side_effect=PermissionError("private detail")):
+                with self.assertRaisesRegex(StateError, "local claim") as raised:
+                    claim_missed_window(ACCOUNT, DAY, True, environ={"EOD_STATE_DIR": directory})
+            self.assertNotIn("private detail", str(raised.exception))
+            self.assertEqual(list(Path(directory).rglob("*.json")), [])
+
+    def test_local_failed_write_retains_notice_but_still_allows_trading_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = {"EOD_STATE_DIR": directory}
+            with patch("src.state.os.fsync", side_effect=OSError("private detail")):
+                with self.assertRaisesRegex(StateError, "local write"):
+                    claim_missed_window(ACCOUNT, DAY, True, environ=env)
+            self.assertFalse(claim_missed_window(ACCOUNT, DAY, True, environ=env))
+            self.assertTrue(claim_session(ACCOUNT, DAY, True, environ=env))
+
+    def test_github_notice_creates_only_separate_atomic_marker_and_deduplicates(self):
+        session = FakeSession([200, 404, 404, 201, 200, 404, 200])
+        self.assertTrue(claim_missed_window(ACCOUNT, DAY, True, environ=ENV, session=session))
+        self.assertFalse(claim_missed_window(ACCOUNT, DAY, True, environ=ENV, session=session))
+        puts = [call for call in session.calls if call[0] == "PUT"]
+        self.assertEqual(len(puts), 1)
+        account_hash = hashlib.sha256(ACCOUNT.encode()).hexdigest()[:16]
+        self.assertTrue(puts[0][1].endswith(
+            f"contents/notifications/missed-window/paper/{account_hash}/2026-10-16.json"
+        ))
+        body = puts[0][2]["json"]
+        self.assertNotIn("sha", body)
+        self.assertEqual(body["branch"], "eod-state")
+        self.assertEqual(body["message"], "Claim EOD missed-window notification 2026-10-16 (paper)")
+        self.assertEqual(json.loads(base64.b64decode(body["content"])), {
+            "event": "missed_window", "mode": "paper", "session_date": "2026-10-16",
+        })
+        for method, url, kwargs in session.calls:
+            if "/contents/sessions/" in url:
+                self.assertEqual(method, "GET")
+            self.assertEqual(kwargs["timeout"], (5, 20))
+            self.assertFalse(kwargs["allow_redirects"])
+
+    def test_github_trading_claim_suppresses_notice_without_mutation(self):
+        session = FakeSession([200, 200])
+        self.assertFalse(claim_missed_window(ACCOUNT, DAY, True, environ=ENV, session=session))
+        self.assertEqual([call[0] for call in session.calls], ["GET", "GET"])
+        self.assertIn("/contents/sessions/", session.calls[-1][1])
+        self.assertFalse(any("/contents/notifications/" in call[1] for call in session.calls))
+
+    def test_github_notice_does_not_impede_later_trading_claim(self):
+        session = FakeSession([200, 404, 404, 201, 200, 404, 201])
+        self.assertTrue(claim_missed_window(ACCOUNT, DAY, True, environ=ENV, session=session))
+        self.assertTrue(claim_session(ACCOUNT, DAY, True, environ=ENV, session=session))
+        paths = [call[1] for call in session.calls if call[0] == "PUT"]
+        self.assertEqual(len(paths), 2)
+        self.assertIn("/contents/notifications/missed-window/", paths[0])
+        self.assertIn("/contents/sessions/", paths[1])
+
+    def test_github_notice_can_initialize_branch_without_claiming_trading(self):
+        session = FakeSession([404, 201, 404, 404, 201])
+        self.assertTrue(claim_missed_window(ACCOUNT, DAY, True, environ=ENV, session=session))
+        self.assertEqual([call[0] for call in session.calls], ["GET", "POST", "GET", "GET", "PUT"])
+        self.assertTrue(session.calls[-1][1].find("/contents/notifications/missed-window/") > 0)
+
+    def test_notice_suppression_lookup_failure_never_means_no_trade(self):
+        for failure in (401, 403, 503, requests.Timeout("private-token https://private.example")):
+            with self.subTest(failure=type(failure).__name__):
+                session = FakeSession([200, failure])
+                with self.assertRaises(StateError) as raised:
+                    claim_missed_window(ACCOUNT, DAY, True, environ=ENV, session=session)
+                self.assertNotIn("private-token", str(raised.exception))
+                self.assertNotIn("https", str(raised.exception))
+                self.assertEqual([call[0] for call in session.calls], ["GET", "GET"])
+
+    def test_ambiguous_github_notice_creation_does_not_retry_or_authorize_alert(self):
+        for failure in (409, 422, 500, requests.Timeout("private-token")):
+            with self.subTest(failure=type(failure).__name__):
+                session = FakeSession([200, 404, 404, failure, 200])
+                self.assertFalse(claim_missed_window(ACCOUNT, DAY, True, environ=ENV, session=session))
+                self.assertEqual(sum(call[0] == "PUT" for call in session.calls), 1)
+                self.assertIn("/contents/notifications/missed-window/", session.calls[-1][1])
+
+    def test_ambiguous_github_notice_without_verified_marker_fails_closed(self):
+        session = FakeSession([200, 404, 404, requests.Timeout("private-token"), 404])
+        with self.assertRaises(StateError) as raised:
+            claim_missed_window(ACCOUNT, DAY, True, environ=ENV, session=session)
+        self.assertNotIn("private-token", str(raised.exception))
+        self.assertEqual(sum(call[0] == "PUT" for call in session.calls), 1)
+
+    def test_invalid_notice_input_or_environment_never_requests_http(self):
+        for account, day, paper, environ in (
+            (None, DAY, True, ENV), (ACCOUNT, "2026-02-30", True, ENV),
+            (ACCOUNT, DAY, "true", ENV), (ACCOUNT, DAY, True, {**ENV, "GITHUB_ACTIONS": "maybe"}),
+            (ACCOUNT, DAY, True, {**ENV, "GITHUB_TOKEN": ""}),
+        ):
+            with self.subTest(account=account, day=day, paper=paper):
+                session = FakeSession([])
+                with self.assertRaises(StateError):
+                    claim_missed_window(account, day, paper, environ=environ, session=session)
+                self.assertEqual(session.calls, [])
 
 
 if __name__ == "__main__":

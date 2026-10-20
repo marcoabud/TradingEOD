@@ -2,7 +2,7 @@
 
 Motor EOD de Alpaca para una cuenta dedicada de aproximadamente USD 4,000. Lee el equity real en cada ejecución, asigna 70% a Dual Momentum semanal y hasta 30% a dos posiciones RSI(2). Las credenciales, el capital y las señales no están incorporados en el código.
 
-**Estado de entrega:** implementación con 123 pruebas automatizadas aprobadas en Python 3.12 y verificación de conexión paper de solo lectura. Se comprobaron los 17 activos, 250 barras por activo y acceso a cotizaciones IEX. No se ha enviado una orden; la prueba conectada se realizó con el mercado cerrado. No hay backtest ni evidencia de rentabilidad incluida. Validar fills durante una sesión paper sigue siendo parte de la puesta en servicio; las pruebas de software no certifican resultados financieros ni disponibilidad del proveedor.
+**Estado de entrega:** implementación con pruebas automatizadas en Python 3.12 y diagnóstico paper de solo lectura. La comprobación inicial verificó 17 activos, 250 barras por activo y acceso a cotizaciones IEX. El 20 de octubre se corrigió la omisión silenciosa de sesiones cuando GitHub entrega tarde los eventos programados: se agregó arranque anticipado y alerta de ventana perdida. No hay backtest ni evidencia de rentabilidad incluida. Validar fills durante una sesión paper sigue siendo parte de la puesta en servicio; las pruebas de software no certifican resultados financieros ni disponibilidad del proveedor.
 
 ## Archivos
 
@@ -14,10 +14,13 @@ Motor EOD de Alpaca para una cuenta dedicada de aproximadamente USD 4,000. Lee e
 | `src/broker.py` | Alpaca, historial de fills, fracciones y conciliación de órdenes |
 | `src/data.py` | Barras ajustadas y validación de cotizaciones |
 | `src/safety.py` | Calendario, ventanas, efectivo y validaciones |
+| `src/scheduling.py` | Selección de cron y espera acotada hasta la ventana válida |
+| `src/diagnostics.py` | Conectividad Alpaca paper y Telegram sin enviar órdenes |
 | `src/state.py` | Registro persistente por cuenta, fecha de Nueva York y modo |
 | `src/notifier.py` | Webhook JSON y Telegram opcionales |
 | `.github/workflows/daily_trading.yml` | Ejecución programada y manual |
 | `.github/workflows/test_telegram.yml` | Prueba manual de Telegram sin acceso a Alpaca |
+| `.github/workflows/check_connection.yml` | Diagnóstico paper de solo lectura y entrega Telegram confirmada |
 | `.github/workflows/ci.yml` | Pruebas sin credenciales ni acceso al broker |
 | `tests/` | Pruebas de indicadores, ejecución, estado, calendario y notificaciones |
 | `setup_and_push.sh` | Instalador autocontenido y publicación Git sin force-push |
@@ -68,9 +71,10 @@ El mensaje indica **PRUEBA MANUAL DE TELEGRAM**, estado `telegram_test` y modo `
 
 1. Agrega las claves **paper**, `ALPACA_PAPER=true` y el feed que realmente tengas contratado/habilitado. Mantén `TRADING_ENABLED` sin definir.
 2. Abre **Actions → Tests** y verifica que las pruebas pasen en GitHub.
-3. Abre **Actions → Daily EOD Trading → Run workflow**, rama `main`, `dry_run=true`, durante la ventana de mercado. Revisa el artifact `eod-summary-…/run_summary.json`. Fuera de ventana termina con `skipped`; esto también comprueba la conectividad de Clock/Calendar cuando existen claves válidas.
-4. Para probar órdenes paper, mantén `ALPACA_PAPER=true` y ejecuta manualmente con `dry_run=false`, o define `TRADING_ENABLED=true` para el calendario. La ejecución manual con `dry_run=false` es una activación explícita y no depende de `TRADING_ENABLED`.
-5. Revisa los fills, saldos, alertas y registro diario durante varias sesiones, incluyendo un rebalanceo semanal. El paso a live requiere que tú cambies a credenciales live y `ALPACA_PAPER=false`; no existe promoción automática.
+3. Abre **Actions → Check Paper Connection → Run workflow** para comprobar Alpaca y Telegram a cualquier hora. Consulta Clock, Calendar, cuenta, posiciones y órdenes abiertas; no evalúa señales ni envía/cancela órdenes. Solo acepta paper y falla si Telegram no confirma. También se ejecuta al publicar cambios en su módulo o su propio workflow. El artifact `connectivity-summary-…` conserva el resultado.
+4. Abre **Actions → Daily EOD Trading → Run workflow**, rama `main`, `dry_run=true`. Con `wait_for_window=true` (predeterminado) puede arrancar hasta 330 minutos antes y esperar. Una ejecución manual posterior a la ventana termina con `skipped`; no recupera una sesión perdida. Revisa `eod-summary-…/run_summary.json`.
+5. Para probar órdenes paper, mantén `ALPACA_PAPER=true` y ejecuta manualmente con `dry_run=false`, o define `TRADING_ENABLED=true` para el calendario. La ejecución manual con `dry_run=false` es una activación explícita y no depende de `TRADING_ENABLED`.
+6. Revisa los fills, saldos, alertas y registro diario durante varias sesiones, incluyendo un rebalanceo semanal. El paso a live requiere que tú cambies a credenciales live y `ALPACA_PAPER=false`; no existe promoción automática.
 
 El workflow usa `GITHUB_TOKEN` automático con `contents: write` únicamente en el job de trading. La política del repositorio/organización debe permitir crear y escribir en la rama `eod-state`. Si lo impide, no se envían órdenes. No hace falta un secret personal de GitHub.
 
@@ -88,11 +92,19 @@ El workflow usa `GITHUB_TOKEN` automático con `contents: write` únicamente en 
 
 Los cron solicitados son `45 19 * * 1-5` y `45 20 * * 1-5` (UTC). Se agregan `45 16 * * 1-5` y `45 17 * * 1-5` para las sesiones que cierran a las 13:00 de Nueva York.
 
+Para reducir el efecto de los retrasos de GitHub se agregan arranques anticipados: `17 14 * * 1-5` / `17 15 * * 1-5` para cierre normal EDT/EST y `17 11 * * 1-5` / `17 12 * * 1-5` para cierre anticipado. Solo el cron correspondiente al cierre de hoy y al horario de verano vigente puede esperar u operar; las otras familias salen inmediatamente. El runner correcto arranca nominalmente 328 minutos antes, consulta Clock a intervalos de hasta un minuto y revalida Calendar antes de continuar. El límite de espera es 330 minutos y el job tiene un máximo de 360 minutos. Esto mantiene un runner ocupado varias horas por sesión; hay que revisar los minutos/costos de Actions antes de cambiar a un repositorio privado o un runner de pago.
+
 Python consulta Clock y Calendar antes de la lógica de cartera. Solo admite inicio entre **cierre−15 y cierre−10 minutos**, y nuevas órdenes antes de **cierre−5 minutos**. En un día normal: inicio 15:45–15:49:59 ET; en cierre anticipado: 12:45–12:49:59 ET. La tolerancia de cinco minutos reconoce retrasos del programador; nunca convierte una ejecución tardía en una orden fuera del horario permitido.
 
 Nueva York alterna EST/EDT. Ciudad de México permanece en UTC−6: un cierre normal equivale a **13:45 CDMX en EDT** y **14:45 CDMX en EST**. No se codifica un horario fijo de México.
 
-GitHub advierte que los eventos `schedule` pueden retrasarse o perderse y, en repositorios públicos inactivos, desactivarse. Esta plataforma no garantiza una orden exactamente a las 15:45 ni una ejecución todos los días. Ante retraso excesivo se omite la sesión. El artifact registra `skipped`; las cuatro ventanas no envían cuatro avisos de mercado cerrado. Las sesiones válidas y errores sí notifican.
+GitHub advierte que los eventos `schedule` pueden retrasarse o perderse y, en repositorios públicos inactivos, desactivarse. Esta plataforma no garantiza una orden exactamente a las 15:45 ni una ejecución todos los días. El arranque anticipado mitiga los retrasos; no ofrece una garantía horaria. Si se requiere esa garantía operativa, debe evaluarse un ejecutor externo y su supervisión.
+
+Si un cron de la familia correcta llega después del límite y no existe un marcador de intento de trading, registra `missed_window`, intenta avisar y termina con error visible en Actions. Un marcador separado evita avisos repetidos del mismo día. Un intento de trading previo suprime esta alerta aunque hubiera fallado después de reservar la sesión; esos fallos tienen su propio resumen. Las familias alternativas, feriados y ejecuciones manuales fuera de horario permanecen en `skipped` sin aviso. Si GitHub nunca entrega ningún evento, este workflow no puede detectar por sí mismo su propia ausencia.
+
+La reserva del aviso ocurre antes de enviarlo y no se borra si Telegram falla: hay hasta tres intentos de entrega dentro de esa ejecución, pero no una entrega garantizada ni reintento en otros cron. Los timeouts de red pueden duplicar un mensaje. El marcador del aviso nunca consume la autorización diaria de trading.
+
+Las simulaciones tardías tampoco consumen marcadores de alerta de trading. Si la ventana vence entre la comprobación previa y la segunda comprobación del motor, la ejecución se bloquea y notifica el error. La cola de concurrencia conserva hasta 100 pendientes (`queue: max`) para que los cron auxiliares no reemplacen los respaldos que ya esperan; solo una ejecución del bot corre a la vez.
 
 ## Controles de ejecución
 
@@ -108,7 +120,7 @@ La prohibición de ida y vuelta intradía se conserva como regla operativa solic
 
 ## Resumen, fallos y recuperación
 
-`run_summary.json` contiene estado (`skipped`, `dry_run`, `completed`, `blocked`, `error`), régimen, fecha de señal, equity, P&L diario, plan, fills y posiciones protegidas. `P&L = equity − last_equity`: no se ajusta por depósitos o retiros. Un dry-run separa órdenes hipotéticas de fills reales. Webhook envía JSON; Telegram envía texto. Ambos usan HTTPS, límites de tiempo y mensajes de error sin exponer URLs/tokens. Un fallo de aviso no revierte órdenes ni provoca nuevas compras.
+`run_summary.json` contiene estado (`skipped`, `missed_window`, `dry_run`, `completed`, `blocked`, `error`), horario observado/objetivo, régimen, fecha de señal, equity, P&L diario, plan, fills y posiciones protegidas. `P&L = equity − last_equity`: no se ajusta por depósitos o retiros. Un dry-run separa órdenes hipotéticas de fills reales. Webhook envía JSON; Telegram envía texto. Ambos usan HTTPS, límites de tiempo y mensajes de error sin exponer URLs/tokens. La entrega queda registrada en `notification_delivery`; un fallo produce error en Actions, sin revertir órdenes ni provocar nuevas compras.
 
 Si hay `unknown_submission`, `cancel_unconfirmed` o ejecución incompleta: revisa órdenes, fills y posiciones directamente en Alpaca. No elimines el marcador diario para forzar otro intento y no vuelvas a ejecutar en otra máquina. El diseño prefiere omitir operaciones a duplicarlas. El marcador se renueva automáticamente para la siguiente fecha; una orden que siga abierta bloqueará la siguiente sesión.
 
