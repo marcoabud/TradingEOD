@@ -1,0 +1,47 @@
+name: Check EOD Market Data
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/market_diagnostics.py'
+      - '.github/workflows/check_market_data.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  read-only-market-check:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONUNBUFFERED: '1'
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      # Trading APIs are never invoked; clock/calendar use the fixed paper URL.
+      ALPACA_PAPER: 'true'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Reconstruct quotes at the calendar EOD target
+        # GET only: no account, positions, orders, trading claims or messages.
+        run: python -m src.market_diagnostics
+      - name: Preserve market data summary
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: market-data-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: market_data_summary.json
+          if-no-files-found: warn
+          retention-days: 30
