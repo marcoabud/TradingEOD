@@ -2,6 +2,11 @@ name: Check EOD Market Data
 
 on:
   workflow_dispatch:
+    inputs:
+      session_date:
+        description: 'Session to reconstruct (YYYY-MM-DD; blank means today in New York)'
+        type: string
+        required: false
   push:
     branches: [main]
     paths:
@@ -22,6 +27,7 @@ jobs:
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
       # Trading APIs are never invoked; clock/calendar use the fixed paper URL.
       ALPACA_PAPER: 'true'
+      EOD_DIAGNOSTIC_DATE: ${{ inputs.session_date || '' }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

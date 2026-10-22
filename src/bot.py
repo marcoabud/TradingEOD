@@ -15,9 +15,9 @@ from .notifier import notify
 from .safety import (NY, SafetyError, aware, decimal, money, quantity,
                      resolve_window, usable_cash, validate_account)
 from .scheduling import prepare_start
-from .state import StateError, claim_missed_window, claim_session
+from .state import StateError, claim_missed_window, claim_session, record_evaluation_attempt
 from .strategy import (DEFENSIVE_SYMBOL, OFFENSIVE_UNIVERSE, SWING_UNIVERSE,
-                       StrategyDataError, core_targets, swing_entries, swing_exits)
+                       StrategyDataError, core_targets, require_current_price, swing_entries, swing_exits)
 
 LOG = logging.getLogger("trading_eod")
 CORE = (*OFFENSIVE_UNIVERSE, DEFENSIVE_SYMBOL)
@@ -56,7 +56,7 @@ class Config:
 
 
 def position_value(position, indicators):
-    return decimal(position.qty) * decimal(indicators[position.symbol].price)
+    return decimal(position.qty) * decimal(require_current_price(indicators[position.symbol]))
 
 
 def block_value(positions, symbols, indicators):
@@ -111,6 +111,7 @@ def plan_buys(positions, indicators, equity, cash, decision, core_buys, excluded
         for symbol, weight in decision.targets.items():
             if symbol not in core_buys or symbol in excluded:
                 continue
+            require_current_price(indicators[symbol])
             current = position_value(positions[symbol], indicators) if symbol in positions else ZERO
             amount = money(min(max(ZERO, decimal(weight)*equity-current), core_room, remaining))
             if amount >= MIN_BUY:
@@ -129,12 +130,34 @@ def plan_buys(positions, indicators, equity, cash, decision, core_buys, excluded
     return plan
 
 
-def refresh_indicators(indicators, data, broker):
-    prices = data.prices(indicators.keys(), lambda: broker.clock().timestamp)
-    return {s: replace(ind, price=prices[s]) for s, ind in indicators.items()}
+def required_quote_symbols(indicators, positions, decision):
+    # RSI is based on completed daily bars. A stock with RSI >= 10 cannot
+    # qualify for an entry, so its live price is irrelevant unless held.
+    needed = {s for s in SWING_UNIVERSE if indicators[s].rsi2 < 10} | set(positions)
+    if decision is not None:
+        needed.update(decision.targets)
+    if needed - set(UNIVERSE):
+        raise SafetyError("Quote scope includes an asset outside the strategy universe")
+    return tuple(s for s in UNIVERSE if s in needed)
 
 
-def run(config, broker, data, summary, claim=claim_session):
+def refresh_indicators(indicators, data, broker, positions, decision):
+    symbols = required_quote_symbols(indicators, positions, decision)
+    prices = data.prices(symbols, lambda: broker.clock().timestamp)
+    if set(symbols) - prices.keys():
+        raise SafetyError("Missing required quotes during refresh")
+    # Unrequested prices stay explicitly absent. Never substitute yesterday's
+    # close or retain an earlier quote for an asset outside the current scope.
+    return {s: replace(ind, price=prices[s] if s in symbols else None) for s, ind in indicators.items()}
+
+
+def snapshot_indicators(summary, indicators):
+    """Keep the audit snapshot aligned with the latest successful quote refresh."""
+    summary.update(quoted_symbols=[s for s, ind in indicators.items() if ind.price is not None],
+                   indicators={s: asdict(ind) for s, ind in indicators.items()})
+
+
+def run(config, broker, data, summary, claim=claim_session, observe=None):
     # Calendar and Clock are always the first account-side operations.
     clock = broker.clock()
     day = aware(clock.timestamp).astimezone(NY).date()
@@ -154,6 +177,10 @@ def run(config, broker, data, summary, claim=claim_session):
         summary["reason"] = "Outside calendar close-minus-15-minute start window (5-minute grace)"
         return
     account = broker.account()
+    if not config.dry_run:
+        observer = record_evaluation_attempt if observe is None else observe
+        observer(account.id, day, config.paper)
+        summary["evaluation_recorded"] = True
     validate_account(account)
     equity = decimal(account.equity)
     summary.update(equity=str(equity), pnl_day=str(equity-decimal(account.last_equity)),
@@ -167,13 +194,14 @@ def run(config, broker, data, summary, claim=claim_session):
     positions = broker.positions()
     assert_portfolio(positions)
     broker.assert_assets(UNIVERSE)
-    indicators = data.load(UNIVERSE, window, broker)
+    indicators = data.load(UNIVERSE, window, broker, quote_symbols=())
     decision = core_targets(indicators) if window.weekly_rebalance else None
+    indicators = refresh_indicators(indicators, data, broker, positions, decision)
+    snapshot_indicators(summary, indicators)
     summary.update(regime=decision.regime if decision else "HOLD_UNTIL_WEEK_END",
                    core_targets=decision.targets if decision else {},
                    core_scores=decision.scores if decision else {},
-                   signal_as_of=indicators["SPY"].as_of,
-                   indicators={s: asdict(i) for s, i in indicators.items()})
+                   signal_as_of=indicators["SPY"].as_of)
     bought_today = broker.traded_symbols(day, "buy")
     sold_today = broker.traded_symbols(day, "sell")
     sells, core_buys, protected = plan_sells(positions, indicators, equity, decision, bought_today)
@@ -217,7 +245,8 @@ def run(config, broker, data, summary, claim=claim_session):
         if symbol in SWING_UNIVERSE and symbol in positions:
             raise SafetyError(f"Swing position remains after confirmed exit: {symbol}")
     assert_portfolio(positions)
-    indicators = refresh_indicators(indicators, data, broker)
+    indicators = refresh_indicators(indicators, data, broker, positions, decision)
+    snapshot_indicators(summary, indicators)
     account = broker.account()
     validate_account(account)
     excluded = broker.traded_symbols(day, "buy") | broker.traded_symbols(day, "sell") | set(sells)
@@ -230,7 +259,8 @@ def run(config, broker, data, summary, claim=claim_session):
         validate_account(account)
         positions = broker.positions()
         assert_portfolio(positions)
-        indicators = refresh_indicators(indicators, data, broker)
+        indicators = refresh_indicators(indicators, data, broker, positions, decision)
+        snapshot_indicators(summary, indicators)
         updated = plan_buys(positions, indicators, decimal(account.equity), usable_cash(account),
                             decision, core_buys, excluded)
         match = next((p for p in updated if p["symbol"] == buy["symbol"]), None)
@@ -273,12 +303,12 @@ def main():
                     reason=("Se perdió la ventana EOD: inicio permitido desde "
                             f"{summary['target_time']} hasta antes de {summary['start_deadline']}; "
                             f"ejecución recibida {summary['observed_at']}. "
-                            "No existe un registro de intento de trading para esta sesión. "
+                            "No hay registro de evaluación EOD ni de sesión de órdenes. "
                             "Esta ejecución no envió órdenes."),
                 )
                 code = 1
             else:
-                summary.update(status="skipped", reason="Session already claimed or missed-window alert already reserved")
+                summary.update(status="skipped", reason="Evaluation recorded, session claimed, or missed-window alert already reserved")
         elif outcome != "skipped":
             raise SafetyError("Unexpected calendar prestart result")
     except (SafetyError, StrategyDataError, StateError) as exc:

@@ -34,7 +34,7 @@ class StrategyDataError(ValueError):
 @dataclass(frozen=True)
 class Indicators:
     symbol: str
-    price: float
+    price: float | None
     close: float
     sma5: float
     sma200: float
@@ -46,10 +46,12 @@ class Indicators:
     as_of: str = ""
 
     def __post_init__(self) -> None:
-        for name in ("price", "close", "sma5", "sma200", "rsi2", "atr14", "r60", "r120", "vol60"):
+        if self.price is not None:
+            require_current_price(self)
+        for name in ("close", "sma5", "sma200", "rsi2", "atr14", "r60", "r120", "vol60"):
             if not math.isfinite(float(getattr(self, name))):
                 raise StrategyDataError(f"{self.symbol}: non-finite {name}")
-        if min(self.price, self.close, self.sma5, self.sma200) <= 0:
+        if min(self.close, self.sma5, self.sma200) <= 0:
             raise StrategyDataError(f"{self.symbol}: prices and averages must be positive")
         if not 0 <= self.rsi2 <= 100 or self.atr14 < 0 or self.vol60 < 0:
             raise StrategyDataError(f"{self.symbol}: invalid indicator range")
@@ -61,6 +63,23 @@ class CoreDecision:
     targets: dict[str, float]
     scores: dict[str, float]
     reasons: tuple[str, ...]
+
+
+def require_current_price(indicator: Indicators) -> float:
+    """Require an explicit current quote; a completed close is never a fallback.
+
+    The market-data layer certifies quote freshness before populating price.
+    Historical-only indicators intentionally retain price=None until then.
+    """
+    if indicator.price is None:
+        raise StrategyDataError(f"{indicator.symbol}: current quote required")
+    try:
+        price = float(indicator.price)
+    except (TypeError, ValueError, OverflowError):
+        raise StrategyDataError(f"{indicator.symbol}: invalid current price") from None
+    if isinstance(indicator.price, bool) or not math.isfinite(price) or price <= 0:
+        raise StrategyDataError(f"{indicator.symbol}: current price must be finite and positive")
+    return price
 
 
 def _numeric_array(values: Sequence[float], name: str) -> np.ndarray:
@@ -125,12 +144,13 @@ def wilder_atr(
     return _wilder_last(true_range, period)
 
 
-def compute_indicators(symbol: str, daily: pd.DataFrame, current_price: float) -> Indicators:
+def compute_indicators(symbol: str, daily: pd.DataFrame, current_price: float | None = None) -> Indicators:
     """Calculate signals from at least 250 ascending, complete daily bars.
 
     Returns are close[-1]/close[-61 or -121]-1. Volatility is the sample
     standard deviation (ddof=1) of the last 60 simple daily returns, times
     sqrt(252). No input is mutated, interpolated, filled, or silently sorted.
+    Omitted current_price remains None; historical close is never substituted.
     """
     if not isinstance(daily, pd.DataFrame) or len(daily) < MIN_HISTORY:
         raise StrategyDataError(f"{symbol}: at least {MIN_HISTORY} completed daily bars required")
@@ -146,9 +166,11 @@ def compute_indicators(symbol: str, daily: pd.DataFrame, current_price: float) -
     if (close <= 0).any():
         raise StrategyDataError(f"{symbol}: closes must be positive")
     try:
-        quote = float(current_price)
-    except (TypeError, ValueError) as exc:
-        raise StrategyDataError(f"{symbol}: invalid current price") from exc
+        quote = None if current_price is None else float(current_price)
+    except (TypeError, ValueError, OverflowError):
+        raise StrategyDataError(f"{symbol}: invalid current price") from None
+    if isinstance(current_price, bool):
+        raise StrategyDataError(f"{symbol}: invalid current price")
     recent = close[-61:]
     returns = recent[1:] / recent[:-1] - 1.0
     return Indicators(
@@ -217,14 +239,15 @@ def swing_exit_reasons(indicator: Indicators, entry_price: float) -> tuple[str, 
     """Return all triggered exits; the execution layer must still enforce PDT."""
     if not math.isfinite(float(entry_price)) or float(entry_price) <= 0:
         raise StrategyDataError(f"{indicator.symbol}: entry price must be finite and positive")
+    price = require_current_price(indicator)
     reasons = []
-    if indicator.price > indicator.sma5:
+    if price > indicator.sma5:
         reasons.append("PRICE_ABOVE_SMA5")
     if indicator.rsi2 > 70:
         reasons.append("RSI2_ABOVE_70")
-    if indicator.price < float(entry_price) - 2.5 * indicator.atr14:
+    if price < float(entry_price) - 2.5 * indicator.atr14:
         reasons.append("CATASTROPHE_ATR_STOP")
-    if indicator.price < indicator.sma200:
+    if price < indicator.sma200:
         reasons.append("PRICE_BELOW_SMA200")
     return tuple(reasons)
 
@@ -268,8 +291,8 @@ def swing_entries(
     candidates = [
         symbol for symbol in universe
         if symbol not in excluded
-        and indicators[symbol].price > indicators[symbol].sma200
         and indicators[symbol].rsi2 < 10
+        and require_current_price(indicators[symbol]) > indicators[symbol].sma200
     ]
     candidates.sort(key=lambda symbol: indicators[symbol].rsi2)
     return candidates[:free_slots]

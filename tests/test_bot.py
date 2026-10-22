@@ -174,7 +174,8 @@ class RunTests(unittest.TestCase):
         data = data or FakeData()
         claim = claim or Mock(return_value=True)
         summary = {}
-        run(Config("fake-key", "fake-secret", True, dry), broker, data, summary, claim=claim)
+        run(Config("fake-key", "fake-secret", True, dry), broker, data, summary,
+            claim=claim, observe=Mock(return_value=True))
         return summary, broker, data, claim
 
     def test_closed_market_skips_before_account_or_data(self):

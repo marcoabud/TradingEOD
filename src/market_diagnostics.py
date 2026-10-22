@@ -8,7 +8,7 @@ instruction to change feeds or loosen price validation. No notifications are sen
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 import logging
 import math
@@ -141,6 +141,16 @@ def market_check(environ=os.environ, *, session=None):
             report["reason"] = "invalid_clock"
             return report, 1
         day = observed.date()
+        requested_day = environ.get("EOD_DIAGNOSTIC_DATE", "").strip()
+        if requested_day:
+            try:
+                day = date.fromisoformat(requested_day)
+                if day > observed.date() or day.isoformat() != requested_day:
+                    raise ValueError
+            except (TypeError, ValueError):
+                report["reason"] = "invalid_or_future_diagnostic_date"
+                return report, 1
+            report["session_date"] = day.isoformat()
         calendar_status, calendar = _get(session, f"{PAPER}/calendar", headers,
                                         {"start": day.isoformat(), "end": day.isoformat()})
         report["calendar"] = calendar_status
@@ -206,6 +216,9 @@ def market_check(environ=os.environ, *, session=None):
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     report, code = market_check()
+    if report["status"] == "completed":
+        from .signal_diagnostics import reconstruct_signals
+        report["signal_replay"] = reconstruct_signals(report, os.environ)
     try:
         Path("market_data_summary.json").write_text(
             json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
@@ -217,6 +230,8 @@ def main():
         LOG.info("IEX %s %s", symbol, json.dumps(result, sort_keys=True, allow_nan=False))
     LOG.info("SIP historical %s", json.dumps(report["sip_historical"], sort_keys=True))
     LOG.info("SIP latest %s", json.dumps(report["sip_latest"], sort_keys=True))
+    if "signal_replay" in report:
+        LOG.info("Historical signal evaluation %s", json.dumps(report["signal_replay"], sort_keys=True))
     return code
 
 

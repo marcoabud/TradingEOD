@@ -69,6 +69,8 @@ class QuoteTests(unittest.TestCase):
     def test_fresh_midpoint(self):
         self.assertEqual(quote_price(self.quote(), self.now, "SPY"), 100)
         self.assertEqual(quote_price(self.quote(timestamp=self.now-timedelta(seconds=90)), self.now, "SPY"), 100)
+        self.assertEqual(quote_price(self.quote(timestamp=self.now+timedelta(seconds=5)), self.now, "SPY"), 100)
+        self.assertEqual(quote_price(self.quote(bid_price=99.75, ask_price=100.25), self.now, "SPY"), 100)
 
     def test_stale_future_crossed_empty_and_wide_quotes_fail(self):
         failures = [
@@ -87,6 +89,44 @@ class QuoteTests(unittest.TestCase):
         for values in ({"bid_size": np.nan}, {"ask_size": np.inf}):
             with self.subTest(values=values), self.assertRaises(SafetyError):
                 quote_price(self.quote(**values), self.now, "SPY")
+
+    def test_diagnostics_report_allowed_numeric_context_and_specific_cause(self):
+        cases = (
+            ({"timestamp": self.now-timedelta(seconds=91)}, "stale"),
+            ({"timestamp": self.now+timedelta(seconds=6)}, "future_timestamp"),
+            ({"bid_price": 101}, "crossed_market"),
+            ({"bid_size": 0}, "empty_size"),
+            ({"ask_price": 101}, "excessive_spread"),
+        )
+        for fields, cause in cases:
+            with self.subTest(cause=cause), self.assertRaises(SafetyError) as raised:
+                quote_price(self.quote(**fields), self.now, "SGOV")
+            message = str(raised.exception)
+            self.assertIn("SGOV", message)
+            self.assertIn(f"cause={cause};", message)
+            self.assertIn("age_seconds=", message)
+            self.assertIn("bid=", message)
+            self.assertIn("ask=", message)
+        with self.assertRaises(SafetyError) as raised:
+            quote_price(self.quote(timestamp=self.now-timedelta(seconds=91)), self.now, "SGOV")
+        self.assertIn("age_seconds=91; bid=99.9; ask=100.1", str(raised.exception))
+
+    def test_malformed_quote_diagnostics_never_echo_raw_values_or_objects(self):
+        secret = "private://token-secret-do-not-print"
+        for fields in ({"timestamp": secret}, {"bid_price": secret}, {"ask_size": secret}):
+            with self.subTest(fields=fields), self.assertRaises(SafetyError) as raised:
+                quote_price(self.quote(**fields), self.now, "SGOV")
+            self.assertNotIn(secret, str(raised.exception))
+            self.assertNotIn("namespace", str(raised.exception))
+
+    def test_empty_quote_scope_has_no_provider_or_clock_call(self):
+        data = object.__new__(MarketData)
+        data.feed = DataFeed.SIP
+        data.client = Mock()
+        clock = Mock(side_effect=AssertionError("Clock is unnecessary without quotes"))
+        self.assertEqual(data.prices((), clock), {})
+        data.client.get_stock_latest_quote.assert_not_called()
+        clock.assert_not_called()
 
     def test_missing_latest_quote_fails_for_whole_batch(self):
         data = object.__new__(MarketData)
@@ -121,6 +161,9 @@ class DataLoadTests(unittest.TestCase):
         self.assertEqual(set(result), {"SPY", "QQQ"})
         self.assertEqual(result["SPY"].as_of, "2026-10-15")
         self.assertEqual(result["SPY"].close, 125.9)
+        self.assertEqual(result["SPY"].price, 130)
+        self.assertEqual(result["QQQ"].price, 130)
+        self.assertEqual(self.data.prices.call_args.args[0], ("SPY", "QQQ"))
         request = self.data.client.get_stock_bars.call_args.args[0]
         self.assertEqual(request.adjustment, Adjustment.ALL)
         self.assertIsNone(request.limit)
@@ -131,6 +174,44 @@ class DataLoadTests(unittest.TestCase):
         self.response({"SPY": bars(self.dates), "QQQ": bars(self.dates[:-1])})
         with self.assertRaises(SafetyError):
             self.data.load(("SPY", "QQQ"), self.window, self.broker)
+        self.data.prices.assert_not_called()  # Every history is checked first.
+
+    def test_empty_quote_scope_preserves_all_history_with_explicit_null_prices(self):
+        self.response({"SPY": bars(self.dates), "SGOV": bars(self.dates)})
+        result = self.data.load(("SPY", "SGOV"), self.window, self.broker, quote_symbols=())
+        self.data.prices.assert_not_called()
+        self.broker.clock.assert_not_called()
+        self.assertEqual(set(result), {"SPY", "SGOV"})
+        self.assertTrue(all(value.price is None for value in result.values()))
+        self.assertEqual(result["SGOV"].close, 125.9)
+
+    def test_quote_subset_does_not_request_sgov_or_fill_its_price_from_close(self):
+        self.response({"SPY": bars(self.dates), "SGOV": bars(self.dates)})
+        result = self.data.load(("SPY", "SGOV"), self.window, self.broker, quote_symbols=("SPY",))
+        self.assertEqual(self.data.prices.call_args.args[0], ("SPY",))
+        self.assertEqual(result["SPY"].price, 130)
+        self.assertIsNone(result["SGOV"].price)
+        self.assertEqual(result["SGOV"].close, 125.9)
+
+    def test_unquoted_history_still_must_pass_full_validation(self):
+        self.response({"SPY": bars(self.dates), "SGOV": bars(self.dates[:-1])})
+        with self.assertRaises(SafetyError):
+            self.data.load(("SPY", "SGOV"), self.window, self.broker, quote_symbols=("SPY",))
+        self.data.prices.assert_not_called()
+
+    def test_quote_scope_must_be_unique_subset_of_historical_symbols(self):
+        for scope in (("SGOV",), ("SPY", "SPY")):
+            with self.subTest(scope=scope), self.assertRaises(SafetyError):
+                self.data.load(("SPY", "QQQ"), self.window, self.broker, quote_symbols=scope)
+        self.data.client.get_stock_bars.assert_not_called()
+        self.broker.calendar.assert_not_called()
+
+    def test_required_quote_failure_is_not_suppressed(self):
+        self.response({"SPY": bars(self.dates), "SGOV": bars(self.dates)})
+        self.data.prices.side_effect = SafetyError("Stale/invalid quote: SGOV")
+        with self.assertRaisesRegex(SafetyError, "SGOV"):
+            self.data.load(("SPY", "SGOV"), self.window, self.broker, quote_symbols=("SGOV",))
+        self.assertEqual(self.data.prices.call_args.args[0], ("SGOV",))
 
     def test_insufficient_calendar_or_missing_symbol_fails(self):
         self.broker.calendar.return_value = [NS(date=d) for d in self.dates[-249:]]

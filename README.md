@@ -16,11 +16,13 @@ Motor EOD de Alpaca para una cuenta dedicada de aproximadamente USD 4,000. Lee e
 | `src/safety.py` | Calendario, ventanas, efectivo y validaciones |
 | `src/scheduling.py` | Selección de cron y espera acotada hasta la ventana válida |
 | `src/diagnostics.py` | Conectividad Alpaca paper y Telegram sin enviar órdenes |
+| `src/market_diagnostics.py`, `src/signal_diagnostics.py` | Reconstrucción de cotizaciones y señales históricas sin operar |
 | `src/state.py` | Registro persistente por cuenta, fecha de Nueva York y modo |
 | `src/notifier.py` | Webhook JSON y Telegram opcionales |
 | `.github/workflows/daily_trading.yml` | Ejecución programada y manual |
 | `.github/workflows/test_telegram.yml` | Prueba manual de Telegram sin acceso a Alpaca |
 | `.github/workflows/check_connection.yml` | Diagnóstico paper de solo lectura y entrega Telegram confirmada |
+| `.github/workflows/check_market_data.yml` | Reconstrucción de datos EOD para una fecha seleccionada |
 | `.github/workflows/ci.yml` | Pruebas sin credenciales ni acceso al broker |
 | `tests/` | Pruebas de indicadores, ejecución, estado, calendario y notificaciones |
 | `setup_and_push.sh` | Instalador autocontenido y publicación Git sin force-push |
@@ -61,6 +63,10 @@ Variables de repositorio (pestaña **Variables**, no Secrets):
 
 El acceso a SIP es independiente de usar una cuenta paper. No hay cambio silencioso a datos IEX: son una cobertura de mercado distinta y pueden cambiar las señales. Si el feed elegido falla, la ejecución se bloquea antes de negociar.
 
+IEX representa una sola bolsa. En la reconstrucción del 21 de octubre de 2026, SGOV superó los 90 segundos de antigüedad, y LLY, JPM y BRK.B superaron el spread permitido. El acceso a latest SIP devolvió HTTP 403. El bot exige una cotización válida cuando el activo interviene en una decisión o está en cartera; no relaja estas reglas para compensar un feed insuficiente. Si un símbolo necesario falla, se requiere resolver el acceso a datos o esperar otra sesión con datos válidos.
+
+**Check EOD Market Data** permite seleccionar `session_date` (`YYYY-MM-DD`; vacío usa la fecha actual de Nueva York). Reconstruye aproximadamente el cierre−15 minutos+3 segundos mediante consultas históricas de solo lectura. Después carga las 250 sesiones completas y evalúa señales bajo el supuesto explícito de una cuenta sin posiciones. Los candidatos son hipotéticos: no lee la cartera, no envía órdenes, no registra una sesión de trading ni notifica Telegram. El resultado de calidad de datos se distingue del éxito de recopilar evidencia; no es un backtest ni prueba de fills. SIP histórico con al menos 15 minutos de antigüedad se consulta solo como comparación; nunca se usa como precio en vivo.
+
 ### Prueba manual de Telegram
 
 Con el token y `TELEGRAM_CHAT_ID` configurados, abre **Actions → Test Telegram → Run workflow**, selecciona `main` y ejecuta la prueba. Puede hacerse a cualquier hora, incluidos fines de semana y feriados: no consulta el calendario de mercado, no utiliza credenciales Alpaca y no ejecuta el motor de trading.
@@ -100,7 +106,7 @@ Nueva York alterna EST/EDT. Ciudad de México permanece en UTC−6: un cierre no
 
 GitHub advierte que los eventos `schedule` pueden retrasarse o perderse y, en repositorios públicos inactivos, desactivarse. Esta plataforma no garantiza una orden exactamente a las 15:45 ni una ejecución todos los días. El arranque anticipado mitiga los retrasos; no ofrece una garantía horaria. Si se requiere esa garantía operativa, debe evaluarse un ejecutor externo y su supervisión.
 
-Si un cron de la familia correcta llega después del límite y no existe un marcador de intento de trading, registra `missed_window`, intenta avisar y termina con error visible en Actions. Un marcador separado evita avisos repetidos del mismo día. Un intento de trading previo suprime esta alerta aunque hubiera fallado después de reservar la sesión; esos fallos tienen su propio resumen. Las familias alternativas, feriados y ejecuciones manuales fuera de horario permanecen en `skipped` sin aviso. Si GitHub nunca entrega ningún evento, este workflow no puede detectar por sí mismo su propia ausencia.
+Si un cron de la familia correcta llega después del límite y no existe registro de evaluación ni de sesión de órdenes, registra `missed_window`, intenta avisar y termina con error visible en Actions. La evaluación se registra después de verificar la ventana y obtener el identificador de cuenta, antes de validar cartera y datos. Así, un bloqueo de cotizaciones no provoca después una falsa alerta de ausencia de evaluación. Ese registro no autoriza órdenes ni impide otro intento válido; `claim_session` conserva su barrera independiente antes de operar. Las simulaciones no crean registros de evaluación. Un marcador separado evita avisos repetidos del mismo día. Las familias alternativas, feriados y ejecuciones manuales fuera de horario permanecen en `skipped` sin aviso. Si GitHub nunca entrega ningún evento, este workflow no puede detectar por sí mismo su propia ausencia.
 
 La reserva del aviso ocurre antes de enviarlo y no se borra si Telegram falla: hay hasta tres intentos de entrega dentro de esa ejecución, pero no una entrega garantizada ni reintento en otros cron. Los timeouts de red pueden duplicar un mensaje. El marcador del aviso nunca consume la autorización diaria de trading.
 
@@ -113,7 +119,7 @@ Las simulaciones tardías tampoco consumen marcadores de alerta de trading. Si l
 3. **Capital:** equity real; gasto acotado por el mínimo de efectivo, buying power y non-marginable buying power, con presupuestos por bloque. No se usa poder de compra apalancado para exceder efectivo. Se requiere cuenta margin activa y sin restricciones, `multiplier >=2`; cuentas 1x/cash se bloquean porque estos campos no certifican por sí solos fondos liquidados T+1. El sistema no pretende cubrir una cuenta cash sin una implementación específica de liquidación.
 4. **Una sesión real:** primero se crea atómicamente un marcador en `eod-state`, por cuenta (hash), fecha y paper/live. Abarca también sesiones sin órdenes. Se mantiene tras errores: un relanzamiento no intenta completar a ciegas un plan parcial. Dry-run no consume marcador. Los IDs de órdenes incorporan fecha, lado y símbolo como protección adicional.
 5. **Barrera entre fases:** todas las ventas deben quedar `filled` y reflejarse en posiciones antes de comprar. Timeout, fill parcial, rechazo o cancelación interrumpen la ejecución. Se cancela únicamente la orden propia pendiente; si no se confirma, el resumen la identifica para conciliación. Una respuesta perdida al enviar se busca por `client_order_id`; jamás se repite el POST de la orden.
-6. **Datos:** exige las 250 sesiones completas por símbolo, OHLCV válidos y cotizaciones con antigüedad ≤90 segundos, tamaños positivos y spread ≤0.5%. Rechaza NaN, huecos, cotizaciones obsoletas o activos no fraccionables. Un fallo puede impedir tanto entradas como salidas; no se inventa un precio de respaldo.
+6. **Datos:** exige las 250 sesiones completas por símbolo y OHLCV válidos. Primero calcula indicadores históricos; después solicita cotizaciones solo para posiciones actuales, objetivos core seleccionados y candidatos swing con RSI(2)<10. Las demás cotizaciones quedan explícitamente en `null`; no se sustituye el precio actual por el cierre anterior. Todos los precios requeridos conservan antigüedad ≤90 segundos, tamaños positivos y spread ≤0.5%. El conjunto se vuelve a calcular tras ventas y antes de cada compra. Rechaza NaN, huecos, cotizaciones obsoletas o activos no fraccionables. Un fallo necesario puede impedir entradas y salidas. Los errores identifican causa, antigüedad y bid/ask; los históricos de SGOV siguen siendo obligatorios para el ranking core aunque no haga falta su precio en vivo ese día.
 7. **Stops EOD:** son evaluaciones al final de la sesión, no stops alojados en el broker ni protección intradía. Gaps, suspensiones, ausencia de señal horaria y prioridad anti-PDT pueden producir pérdidas superiores a 2.5 ATR. Market orders ejecutan al precio disponible; la tolerancia de pesos reduce rotación, no garantiza un precio de ejecución.
 
 La prohibición de ida y vuelta intradía se conserva como regla operativa solicitada. No se presenta como certificación de cumplimiento normativo universal; las condiciones regulatorias y de cuenta del broker deben verificarse por separado.

@@ -169,9 +169,24 @@ class MarketDiagnosticsTests(unittest.TestCase):
         self.assertIn("timestamp", report["sip_latest"])
         self.assertNotIn("fake-secret", json.dumps(report))
 
+    def test_explicit_previous_date_works_after_new_york_midnight(self):
+        self.clock["timestamp"] = "2026-10-22T05:00:00Z"
+        report, code = self.check({**ENV, "EOD_DIAGNOSTIC_DATE": "2026-10-21"})
+        self.assertEqual(code, 0)
+        self.assertEqual(report["session_date"], "2026-10-21")
+        self.assertEqual(report["status"], "completed")
+        self.assertEqual(self.session.get.call_args_list[1].kwargs["params"]["start"], "2026-10-21")
+
+    def test_invalid_or_future_requested_date_is_rejected(self):
+        for value in ("not-a-date", "2026-10-22", "20261021"):
+            report, code = self.check({**ENV, "EOD_DIAGNOSTIC_DATE": value})
+            self.assertEqual(code, 1)
+            self.assertEqual(report["reason"], "invalid_or_future_diagnostic_date")
+
     def test_main_saves_report_and_no_notification(self):
         report, code = self.check()
         with patch("src.market_diagnostics.market_check", return_value=(report, code)), \
+             patch("src.signal_diagnostics.reconstruct_signals", return_value={"status": "completed", "read_only": True}), \
              patch("src.market_diagnostics.Path.write_text") as save:
             self.assertEqual(main(), 0)
         self.assertEqual(json.loads(save.call_args.args[0]), report)

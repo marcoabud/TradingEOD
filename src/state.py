@@ -12,6 +12,9 @@ and use exclusive file creation.  Local state coordinates only processes sharing
 that directory and does not coordinate with GitHub or another machine. Dry runs
 must not claim trading sessions. Missed-window notification claims use their own
 namespace and never consume or overwrite a trading-session marker.
+Evaluation-attempt markers record that the engine started evaluating in its
+permitted window. They suppress false missed-window alerts but grant no orders
+and never prevent another evaluation from reaching the execution claim.
 """
 
 from __future__ import annotations
@@ -61,13 +64,14 @@ def _error(operation: str, status: int | None = None) -> StateError:
 
 def _claim_local(
     state_dir: str, marker_path: str, payload: bytes, *,
-    suppress_if_exists: str | None = None,
+    suppress_if_exists: str | tuple[str, ...] | None = None,
 ) -> bool:
     if not state_dir or not Path(state_dir).is_absolute():
         raise StateError("Local execution requires an absolute EOD_STATE_DIR")
-    if suppress_if_exists is not None:
+    suppressions = (suppress_if_exists,) if isinstance(suppress_if_exists, str) else (suppress_if_exists or ())
+    for suppression_path in suppressions:
         try:
-            (Path(state_dir) / suppress_if_exists).stat()
+            (Path(state_dir) / suppression_path).stat()
         except FileNotFoundError:
             pass
         except OSError:
@@ -97,7 +101,7 @@ def _claim_local(
 
 def _claim_github(
     environ: Mapping[str, str], marker_path: str, payload: bytes, day: str, mode: str,
-    session: requests.Session, *, suppress_if_exists: str | None = None,
+    session: requests.Session, *, suppress_if_exists: str | tuple[str, ...] | None = None,
     claim_label: str = "session",
 ) -> bool:
     repository = environ.get("GITHUB_REPOSITORY", "")
@@ -155,8 +159,10 @@ def _claim_github(
                 if not branch_exists():
                     raise _error("branch creation", created.status_code)
 
-    if suppress_if_exists is not None and marker_exists(suppress_if_exists):
-        return False
+    suppressions = (suppress_if_exists,) if isinstance(suppress_if_exists, str) else (suppress_if_exists or ())
+    for suppression_path in suppressions:
+        if marker_exists(suppression_path):
+            return False
     if marker_exists():
         return False
     body = {
@@ -183,7 +189,7 @@ def _claim_github(
 def _claim_marker(
     environ: Mapping[str, str], session: requests.Session | None,
     marker_path: str, payload: bytes, day: str, mode: str, *,
-    suppress_if_exists: str | None = None, claim_label: str = "session",
+    suppress_if_exists: str | tuple[str, ...] | None = None, claim_label: str = "session",
 ) -> bool:
     github_actions = environ.get("GITHUB_ACTIONS", "").lower()
     if github_actions not in ("", "false", "true"):
@@ -235,19 +241,49 @@ def claim_missed_window(
 ) -> bool:
     """Reserve one missed-window alert without claiming the trading session.
 
-    An existing execution marker suppresses the alert, even if that execution
-    failed after claiming its session. Only a new notification marker returns
-    True. The marker is written BEFORE sending and is retained if delivery fails:
+    An existing evaluation or execution marker suppresses the alert, including
+    evaluations blocked by data validation before any execution claim. Only a
+    new notification marker returns True. The marker is written BEFORE sending
+    and is retained if delivery fails:
     this is best-effort notification, with no guaranteed retry on a later run.
     Callers must still enforce calendar/window checks; this grants no orders.
     """
     account_hash, day, mode = _validated_inputs(account_id, session_date, paper)
     execution_path = f"sessions/{mode}/{account_hash}/{day}.json"
+    evaluation_path = f"evaluations/{mode}/{account_hash}/{day}.json"
     notice_path = f"notifications/missed-window/{mode}/{account_hash}/{day}.json"
     payload = (json.dumps(
         {"session_date": day, "mode": mode, "event": "missed_window"}, sort_keys=True,
     ) + "\n").encode("utf-8")
     return _claim_marker(
         environ, session, notice_path, payload, day, mode,
-        suppress_if_exists=execution_path, claim_label="missed-window notification",
+        suppress_if_exists=(execution_path, evaluation_path), claim_label="missed-window notification",
+    )
+
+
+def record_evaluation_attempt(
+    account_id: object,
+    session_date: date | str,
+    paper: bool,
+    *,
+    environ: Mapping[str, str] = os.environ,
+    session: requests.Session | None = None,
+) -> bool:
+    """Record an in-window evaluation independently of the order-session claim.
+
+    Return True for a newly created marker and False when one already exists.
+    BOTH results allow the caller to continue validating the evaluation: False
+    must not be treated as a duplicate-trading veto. This record does not grant
+    permission to submit orders; claim_session remains the execution barrier.
+    Call only after verifying the start window and obtaining the account ID,
+    before validations that could block evaluation, and never for a dry run.
+    Unverifiable persistence raises StateError and never implies success.
+    """
+    account_hash, day, mode = _validated_inputs(account_id, session_date, paper)
+    marker_path = f"evaluations/{mode}/{account_hash}/{day}.json"
+    payload = (json.dumps(
+        {"session_date": day, "mode": mode, "event": "evaluation_started"}, sort_keys=True,
+    ) + "\n").encode("utf-8")
+    return _claim_marker(
+        environ, session, marker_path, payload, day, mode, claim_label="evaluation attempt",
     )

@@ -9,7 +9,7 @@ import pandas as pd
 
 from src.strategy import (
     OFFENSIVE_UNIVERSE, SWING_UNIVERSE, Indicators, StrategyDataError,
-    compute_indicators, core_targets, momentum_score, swing_entries,
+    compute_indicators, core_targets, momentum_score, require_current_price, swing_entries,
     swing_exit_reasons, swing_exits, wilder_atr, wilder_rsi,
 )
 
@@ -78,6 +78,24 @@ class HistoricalCalculationTests(unittest.TestCase):
         self.assertEqual(replace(low, price=500), high)
         pd.testing.assert_frame_equal(self.frame, original)
 
+    def test_historical_only_indicators_keep_price_absent(self):
+        historical = compute_indicators("SPY", self.frame)
+        quoted = compute_indicators("SPY", self.frame, 351)
+        self.assertIsNone(historical.price)
+        self.assertEqual(historical.close, 350)
+        self.assertEqual(replace(historical, price=351), quoted)
+        with self.assertRaisesRegex(StrategyDataError, "current quote required"):
+            require_current_price(historical)
+
+    def test_optional_price_rejects_invalid_values_instead_of_substituting_close(self):
+        for price in (float("nan"), float("inf"), 0, -1, "invalid", True):
+            with self.subTest(price=price):
+                with self.assertRaises(StrategyDataError):
+                    compute_indicators("SPY", self.frame, price)
+                with self.assertRaises(StrategyDataError):
+                    indicator("SPY", price=price)
+        self.assertEqual(require_current_price(indicator(price=110.5)), 110.5)
+
     def test_bad_history_fails_closed(self):
         missing = self.frame.copy()
         missing.iloc[-1, missing.columns.get_loc("close")] = np.nan
@@ -91,6 +109,17 @@ class HistoricalCalculationTests(unittest.TestCase):
 
 
 class CoreTests(unittest.TestCase):
+    def test_core_decision_needs_no_live_quotes_in_either_regime(self):
+        quoted = core_fixture()
+        historical = {symbol: replace(value, price=None) for symbol, value in quoted.items()}
+        self.assertEqual(core_targets(historical), core_targets(quoted))
+        self.assertEqual(core_targets(historical).regime, "RISK-ON")
+        historical["SPY"] = replace(historical["SPY"], close=99)
+        decision = core_targets(historical)
+        self.assertEqual(decision.regime, "RISK-OFF")
+        self.assertEqual(decision.targets, {"SGOV": .70})
+        self.assertIsNone(historical["SGOV"].price)
+
     def test_score_and_deterministic_equal_score_ranking(self):
         values = core_fixture()
         self.assertAlmostEqual(momentum_score(values["SPY"]), .7)
@@ -134,6 +163,16 @@ class CoreTests(unittest.TestCase):
 
 
 class SwingTests(unittest.TestCase):
+    def test_swing_comparisons_reject_missing_current_quotes(self):
+        values = {symbol: indicator(symbol) for symbol in SWING_UNIVERSE}
+        values["AAPL"] = indicator("AAPL", price=None)
+        with self.assertRaisesRegex(StrategyDataError, "AAPL: current quote required"):
+            swing_entries(values, [])
+        with self.assertRaisesRegex(StrategyDataError, "AAPL: current quote required"):
+            swing_exit_reasons(values["AAPL"], 110)
+        with self.assertRaisesRegex(StrategyDataError, "AAPL: current quote required"):
+            swing_exits(values, {"AAPL": 110})
+
     def test_exit_thresholds_are_strict(self):
         # All equalities: price==SMA5==SMA200==entry-2.5*ATR and RSI==70.
         position = indicator(price=100, sma5=100, sma200=100, rsi2=70, atr14=4)

@@ -1,5 +1,7 @@
-"""Validated historical bars and fresh quotes. Missing observations never get filled."""
+"""Validated historical bars and scoped fresh quotes; missing prices stay absent."""
+from dataclasses import replace
 from datetime import timedelta
+import re
 
 import numpy as np
 import pandas as pd
@@ -33,15 +35,52 @@ def validate_bars(frame, expected_dates, symbol):
     return frame
 
 
+def _quote_number(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if np.isfinite(number) else None
+
+
+def _quote_error(symbol, cause, age, bid, ask):
+    # Only recognized ticker syntax, numeric fields and fixed cause codes are
+    # allowed in diagnostics. Never expose quote objects, URLs or exception text.
+    ticker = symbol if isinstance(symbol, str) and re.fullmatch(r"[A-Z0-9.\-]{1,16}", symbol) else "unknown_symbol"
+    def number(value):
+        return f"{value:.6g}" if value is not None else "unavailable"
+    return SafetyError(
+        f"Stale/invalid quote: {ticker} (cause={cause}; age_seconds={number(age)}; "
+        f"bid={number(bid)}; ask={number(ask)})"
+    )
+
+
 def quote_price(quote, now, symbol):
-    age = (aware(now) - aware(quote.timestamp)).total_seconds()
-    bid, ask = float(quote.bid_price), float(quote.ask_price)
-    if not (-5 <= age <= 90) or not np.isfinite([bid, ask]).all() or not 0 < bid <= ask:
-        raise SafetyError(f"Stale/invalid quote: {symbol}")
-    sizes = [float(quote.bid_size), float(quote.ask_size)]
-    if not np.isfinite(sizes).all() or min(sizes) <= 0 or (ask-bid)/((ask+bid)/2) > 0.005:
-        raise SafetyError(f"Empty or excessive spread: {symbol}")
-    return (bid + ask) / 2
+    bid = _quote_number(getattr(quote, "bid_price", None))
+    ask = _quote_number(getattr(quote, "ask_price", None))
+    try:
+        age = (aware(now) - aware(quote.timestamp)).total_seconds()
+    except (AttributeError, TypeError, ValueError, OverflowError, SafetyError):
+        raise _quote_error(symbol, "invalid_timestamp", None, bid, ask) from None
+    if age < -5:
+        raise _quote_error(symbol, "future_timestamp", age, bid, ask)
+    if age > 90:
+        raise _quote_error(symbol, "stale", age, bid, ask)
+    if bid is None or ask is None:
+        raise _quote_error(symbol, "invalid_price", age, bid, ask)
+    if bid <= 0 or ask <= 0:
+        raise _quote_error(symbol, "nonpositive_price", age, bid, ask)
+    if bid > ask:
+        raise _quote_error(symbol, "crossed_market", age, bid, ask)
+    sizes = [_quote_number(getattr(quote, name, None)) for name in ("bid_size", "ask_size")]
+    if any(size is None for size in sizes):
+        raise _quote_error(symbol, "invalid_size", age, bid, ask)
+    if min(sizes) <= 0:
+        raise _quote_error(symbol, "empty_size", age, bid, ask)
+    midpoint = bid / 2 + ask / 2
+    if (ask - bid) / midpoint > 0.005:
+        raise _quote_error(symbol, "excessive_spread", age, bid, ask)
+    return midpoint
 
 
 class MarketData:
@@ -53,6 +92,8 @@ class MarketData:
 
     def prices(self, symbols, now):
         symbols = list(symbols)
+        if not symbols:
+            return {}
         quotes = self.client.get_stock_latest_quote(StockLatestQuoteRequest(
             symbol_or_symbols=symbols, feed=self.feed))
         now = now() if callable(now) else now
@@ -60,7 +101,18 @@ class MarketData:
             raise SafetyError("Missing latest quotes")
         return {s: quote_price(quotes[s], now, s) for s in symbols}
 
-    def load(self, symbols, window, broker):
+    def load(self, symbols, window, broker, *, quote_symbols=None):
+        """Validate all history, then attach only explicitly requested quotes.
+
+        None preserves the all-symbol quote behavior; an empty iterable fetches
+        history alone. Unquoted indicators retain price=None, never last close.
+        """
+        symbols = tuple(symbols)
+        if not symbols or len(set(symbols)) != len(symbols):
+            raise SafetyError("Historical symbol universe must be nonempty and unique")
+        requested_quotes = symbols if quote_symbols is None else tuple(quote_symbols)
+        if len(set(requested_quotes)) != len(requested_quotes) or set(requested_quotes) - set(symbols):
+            raise SafetyError("Quote symbols must be a unique subset of the historical universe")
         sessions = broker.calendar(window.day-timedelta(days=550), window.day-timedelta(days=1))
         dates = sorted({s.date for s in sessions})[-250:]
         if len(dates) != 250:
@@ -74,11 +126,15 @@ class MarketData:
         frame = response.df
         if frame.empty or not isinstance(frame.index, pd.MultiIndex):
             raise SafetyError("Historical bars missing")
-        prices = self.prices(symbols, lambda: broker.clock().timestamp)
         indicators = {}
         for symbol in symbols:
             if symbol not in frame.index.get_level_values("symbol"):
                 raise SafetyError(f"Historical bars missing: {symbol}")
             clean = validate_bars(frame.xs(symbol, level="symbol"), dates, symbol)
-            indicators[symbol] = compute_indicators(symbol, clean, prices[symbol])
+            indicators[symbol] = compute_indicators(symbol, clean)
+        # Complete validation of every history precedes any required quote call.
+        if requested_quotes:
+            prices = self.prices(requested_quotes, lambda: broker.clock().timestamp)
+            for symbol in requested_quotes:
+                indicators[symbol] = replace(indicators[symbol], price=prices[symbol])
         return indicators
