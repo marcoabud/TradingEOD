@@ -211,6 +211,120 @@ class SchedulingTests(unittest.TestCase):
         self.assertNotIn("dry_run", summary)
         self.assertNotIn("session_claimed", summary)
 
+    def test_preflight_wakes_at_target_minus_five_and_runs_only_once(self):
+        broker = Broker(datetime(2026, 10, 20, 15, 38, 30, tzinfo=NY))
+        observed = []
+        preflight = Mock(side_effect=lambda window: observed.append(
+            (broker.start + timedelta(seconds=broker.timer.elapsed), window.target),
+        ))
+        outcome, summary = self.run_prepare(broker, wait_for_window=True, preflight=preflight)
+        self.assertEqual(outcome, "ready")
+        preflight.assert_called_once()
+        self.assertEqual(observed[0][0], observed[0][1] - timedelta(minutes=5))
+        self.assertEqual(broker.timer.sleeps[:2], [60, 30])
+        self.assertTrue(all(0 < seconds <= 60 for seconds in broker.timer.sleeps))
+        self.assertEqual(summary["preflight"], {
+            "status": "completed", "observed_at": "2026-10-20T15:40:00-04:00",
+        })
+        self.assertNotIn("session_claimed", summary)
+
+    def test_preflight_runs_immediately_if_wait_begins_within_its_window(self):
+        broker = Broker(datetime(2026, 10, 20, 15, 43, 30, tzinfo=NY))
+        preflight = Mock(side_effect=lambda window: self.assertEqual(broker.timer.elapsed, 0))
+        outcome, _ = self.run_prepare(broker, wait_for_window=True, preflight=preflight)
+        self.assertEqual(outcome, "ready")
+        preflight.assert_called_once()
+
+    def test_early_close_preflight_uses_calendar_target(self):
+        broker = Broker(datetime(2026, 11, 27, 12, 39, 30, tzinfo=NY), close="13:00")
+        preflight = Mock()
+        outcome, summary = self.run_prepare(
+            broker, event_name="schedule", scheduled_cron="17 12 * * 1-5",
+            wait_for_window=True, preflight=preflight,
+        )
+        self.assertEqual(outcome, "ready")
+        self.assertEqual(summary["preflight"]["observed_at"], "2026-11-27T12:40:00-05:00")
+        self.assertEqual(preflight.call_args.args[0].target.hour, 12)
+
+    def test_preflight_does_not_run_on_immediate_ready_late_or_nonwaiting_runs(self):
+        for hour, minute, wait, expected in ((15, 45, True, "ready"),
+                                             (15, 50, True, "missed_window"),
+                                             (15, 42, False, "skipped")):
+            with self.subTest(minute=minute):
+                broker = Broker(datetime(2026, 10, 20, hour, minute, tzinfo=NY))
+                preflight = Mock()
+                outcome, summary = self.run_prepare(
+                    broker, event_name="schedule", scheduled_cron="45 19 * * 1-5",
+                    wait_for_window=wait, preflight=preflight,
+                )
+                self.assertEqual(outcome, expected)
+                preflight.assert_not_called()
+                self.assertNotIn("preflight", summary)
+
+    def test_preflight_does_not_run_on_holiday_or_alternative_cron(self):
+        for holiday in (False, True):
+            with self.subTest(holiday=holiday):
+                broker = Broker(datetime(2026, 10, 20, 15, 42, tzinfo=NY))
+                broker.session_exists = not holiday
+                preflight = Mock()
+                outcome, _ = self.run_prepare(
+                    broker, event_name="schedule", scheduled_cron="45 20 * * 1-5",
+                    wait_for_window=True, preflight=preflight,
+                )
+                self.assertEqual(outcome, "skipped")
+                preflight.assert_not_called()
+
+    def test_preflight_does_not_run_when_clock_reports_market_closed(self):
+        broker = Broker(datetime(2026, 10, 20, 15, 42, tzinfo=NY), is_open=False)
+        preflight = Mock()
+        with self.assertRaisesRegex(SafetyError, "closed inside"):
+            self.run_prepare(broker, wait_for_window=True, preflight=preflight)
+        preflight.assert_not_called()
+
+    def test_preflight_failure_is_sanitized_nonfatal_and_not_retried(self):
+        broker = Broker(datetime(2026, 10, 20, 15, 44, tzinfo=NY))
+        preflight = Mock(side_effect=RuntimeError("private-token https://secret.example"))
+        with self.assertLogs("trading_eod.scheduling", level="WARNING") as logs:
+            outcome, summary = self.run_prepare(broker, wait_for_window=True, preflight=preflight)
+        self.assertEqual(outcome, "ready")
+        self.assertEqual(summary["status"], "ready")
+        self.assertEqual(summary["preflight"]["status"], "failed")
+        preflight.assert_called_once()
+        for private in ("private-token", "https://secret.example"):
+            self.assertNotIn(private, str(summary))
+            self.assertNotIn(private, " ".join(logs.output))
+
+    def test_clock_is_reread_after_slow_preflight_without_sleeping_past_target(self):
+        broker = Broker(datetime(2026, 10, 20, 15, 44, tzinfo=NY))
+        def slow_preflight(window):
+            broker.timer.elapsed += 70
+        outcome, summary = self.run_prepare(broker, wait_for_window=True, preflight=slow_preflight)
+        self.assertEqual(outcome, "ready")
+        self.assertEqual(broker.timer.sleeps, [])
+        self.assertEqual(summary["observed_at"], "2026-10-20T15:45:10-04:00")
+        self.assertEqual(broker.trace[-2:], ["clock", "calendar"])
+
+    def test_preflight_that_overruns_start_deadline_cannot_authorize_run(self):
+        broker = Broker(datetime(2026, 10, 20, 15, 44, tzinfo=NY))
+        def too_slow(window):
+            broker.timer.elapsed += 7 * 60
+        preflight = Mock(side_effect=too_slow)
+        outcome, _ = self.run_prepare(
+            broker, event_name="schedule", scheduled_cron="45 19 * * 1-5",
+            wait_for_window=True, preflight=preflight,
+        )
+        self.assertEqual(outcome, "missed_window")
+        preflight.assert_called_once()
+        self.assertEqual(broker.timer.sleeps, [])
+
+    def test_clock_jump_over_preflight_window_never_calls_it_late(self):
+        broker = Broker(datetime(2026, 10, 20, 15, 39, tzinfo=NY))
+        broker.clock_transform = lambda value: value + timedelta(minutes=5) if broker.timer.elapsed else value
+        preflight = Mock()
+        outcome, _ = self.run_prepare(broker, wait_for_window=True, preflight=preflight)
+        self.assertEqual(outcome, "ready")
+        preflight.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

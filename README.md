@@ -2,7 +2,7 @@
 
 Motor EOD de Alpaca para una cuenta dedicada de aproximadamente USD 4,000. Lee el equity real en cada ejecución, asigna 70% a Dual Momentum semanal y hasta 30% a dos posiciones RSI(2). Las credenciales, el capital y las señales no están incorporados en el código.
 
-**Estado de entrega:** implementación con pruebas automatizadas en Python 3.12 y diagnóstico paper de solo lectura. La comprobación inicial verificó 17 activos, 250 barras por activo y acceso a cotizaciones IEX. El 20 de octubre se corrigió la omisión silenciosa de sesiones cuando GitHub entrega tarde los eventos programados: se agregó arranque anticipado y alerta de ventana perdida. No hay backtest ni evidencia de rentabilidad incluida. Validar fills durante una sesión paper sigue siendo parte de la puesta en servicio; las pruebas de software no certifican resultados financieros ni disponibilidad del proveedor.
+**Estado de entrega, 23 de octubre de 2026:** implementación con pruebas automatizadas en Python 3.12, recuperación acotada de cotizaciones y omisiones por activo. El 22 de octubre el bot evaluó a tiempo, confirmó Telegram y no operó porque ninguno de los doce swings cumplía RSI(2)<10; el core no correspondía ese jueves. La nueva versión añade medición automática de sesiones paper. Siguen pendientes diez sesiones observadas, dos evaluaciones semanales y comprobar compras y posteriores ventas reales en paper. No hay backtest ni evidencia de rentabilidad incluida.
 
 ## Archivos
 
@@ -13,6 +13,8 @@ Motor EOD de Alpaca para una cuenta dedicada de aproximadamente USD 4,000. Lee e
 | `src/strategy.py` | Momentum, SMA, RSI y ATR Wilder; funciones sin efectos externos |
 | `src/broker.py` | Alpaca, historial de fills, fracciones y conciliación de órdenes |
 | `src/data.py` | Barras ajustadas y validación de cotizaciones |
+| `src/quotes.py`, `src/execution.py` | Consultas acotadas, omisiones por activo y barrera ventas/compras |
+| `src/observation.py` | Evidencia posterior de la sesión y comparación histórica con SIP |
 | `src/safety.py` | Calendario, ventanas, efectivo y validaciones |
 | `src/scheduling.py` | Selección de cron y espera acotada hasta la ventana válida |
 | `src/diagnostics.py` | Conectividad Alpaca paper y Telegram sin enviar órdenes |
@@ -23,6 +25,8 @@ Motor EOD de Alpaca para una cuenta dedicada de aproximadamente USD 4,000. Lee e
 | `.github/workflows/test_telegram.yml` | Prueba manual de Telegram sin acceso a Alpaca |
 | `.github/workflows/check_connection.yml` | Diagnóstico paper de solo lectura y entrega Telegram confirmada |
 | `.github/workflows/check_market_data.yml` | Reconstrucción de datos EOD para una fecha seleccionada |
+| `.github/workflows/observe_paper.yml` | Observación automática tras las ejecuciones paper |
+| `docs/DATOS_FUTUROS.md` | Criterios para evaluar un proveedor externo más económico |
 | `.github/workflows/ci.yml` | Pruebas sin credenciales ni acceso al broker |
 | `tests/` | Pruebas de indicadores, ejecución, estado, calendario y notificaciones |
 | `setup_and_push.sh` | Instalador autocontenido y publicación Git sin force-push |
@@ -61,9 +65,9 @@ Variables de repositorio (pestaña **Variables**, no Secrets):
 | `TRADING_ENABLED` | Ausente o distinto de `true`: las ejecuciones programadas solo simulan. `true`: permite enviar órdenes al entorno indicado por `ALPACA_PAPER` |
 | `ALPACA_DATA_FEED` | `sip` por defecto; requiere acceso a datos SIP recientes. `iex` permite el feed IEX si está habilitado en tu cuenta |
 
-El acceso a SIP es independiente de usar una cuenta paper. No hay cambio silencioso a datos IEX: son una cobertura de mercado distinta y pueden cambiar las señales. Si el feed elegido falla, la ejecución se bloquea antes de negociar.
+El acceso a SIP es independiente de usar una cuenta paper. No hay cambio silencioso a datos IEX: son una cobertura de mercado distinta y pueden cambiar las señales. Un error de permisos o un fallo general del proveedor detiene la secuencia; una cotización individual inválida activa la política de omisiones descrita abajo.
 
-IEX representa una sola bolsa. En la reconstrucción del 21 de octubre de 2026, SGOV superó los 90 segundos de antigüedad, y LLY, JPM y BRK.B superaron el spread permitido. El acceso a latest SIP devolvió HTTP 403. El bot exige una cotización válida cuando el activo interviene en una decisión o está en cartera; no relaja estas reglas para compensar un feed insuficiente. Si un símbolo necesario falla, se requiere resolver el acceso a datos o esperar otra sesión con datos válidos.
+IEX representa una sola bolsa. En la reconstrucción del 21 de octubre de 2026, SGOV superó los 90 segundos de antigüedad, y LLY, JPM y BRK.B superaron el spread permitido. El acceso a latest SIP devolvió HTTP 403. El bot exige una cotización válida cuando el activo interviene en una decisión o está en cartera; no relaja estas reglas para compensar un feed insuficiente. Tras agotar la recuperación de un símbolo, omite las órdenes dependientes y conserva las decisiones independientes que todavía pueden justificarse.
 
 **Check EOD Market Data** permite seleccionar `session_date` (`YYYY-MM-DD`; vacío usa la fecha actual de Nueva York). Reconstruye aproximadamente el cierre−15 minutos+3 segundos mediante consultas históricas de solo lectura. Después carga las 250 sesiones completas y evalúa señales bajo el supuesto explícito de una cuenta sin posiciones. Los candidatos son hipotéticos: no lee la cartera, no envía órdenes, no registra una sesión de trading ni notifica Telegram. El resultado de calidad de datos se distingue del éxito de recopilar evidencia; no es un backtest ni prueba de fills. SIP histórico con al menos 15 minutos de antigüedad se consulta solo como comparación; nunca se usa como precio en vivo.
 
@@ -119,14 +123,40 @@ Las simulaciones tardías tampoco consumen marcadores de alerta de trading. Si l
 3. **Capital:** equity real; gasto acotado por el mínimo de efectivo, buying power y non-marginable buying power, con presupuestos por bloque. No se usa poder de compra apalancado para exceder efectivo. Se requiere cuenta margin activa y sin restricciones, `multiplier >=2`; cuentas 1x/cash se bloquean porque estos campos no certifican por sí solos fondos liquidados T+1. El sistema no pretende cubrir una cuenta cash sin una implementación específica de liquidación.
 4. **Una sesión real:** primero se crea atómicamente un marcador en `eod-state`, por cuenta (hash), fecha y paper/live. Abarca también sesiones sin órdenes. Se mantiene tras errores: un relanzamiento no intenta completar a ciegas un plan parcial. Dry-run no consume marcador. Los IDs de órdenes incorporan fecha, lado y símbolo como protección adicional.
 5. **Barrera entre fases:** todas las ventas deben quedar `filled` y reflejarse en posiciones antes de comprar. Timeout, fill parcial, rechazo o cancelación interrumpen la ejecución. Se cancela únicamente la orden propia pendiente; si no se confirma, el resumen la identifica para conciliación. Una respuesta perdida al enviar se busca por `client_order_id`; jamás se repite el POST de la orden.
-6. **Datos:** exige las 250 sesiones completas por símbolo y OHLCV válidos. Primero calcula indicadores históricos; después solicita cotizaciones solo para posiciones actuales, objetivos core seleccionados y candidatos swing con RSI(2)<10. Las demás cotizaciones quedan explícitamente en `null`; no se sustituye el precio actual por el cierre anterior. Todos los precios requeridos conservan antigüedad ≤90 segundos, tamaños positivos y spread ≤0.5%. El conjunto se vuelve a calcular tras ventas y antes de cada compra. Rechaza NaN, huecos, cotizaciones obsoletas o activos no fraccionables. Un fallo necesario puede impedir entradas y salidas. Los errores identifican causa, antigüedad y bid/ask; los históricos de SGOV siguen siendo obligatorios para el ranking core aunque no haga falta su precio en vivo ese día.
+6. **Datos:** exige 250 sesiones completas por símbolo y OHLCV válidos. Calcula indicadores históricos y pide cotizaciones de posiciones y destinos core; las de nuevas entradas se piden después de resolver salidas y slots. Precios no requeridos quedan en `null`. Mantiene antigüedad ≤90 segundos, tamaños positivos y spread ≤0.5%, también en una última comprobación local justo antes del POST. No sustituye un precio actual por cierre previo, trade, barra o `market_value`. Los históricos de SGOV siguen siendo obligatorios aunque no necesite cotización en vivo.
 7. **Stops EOD:** son evaluaciones al final de la sesión, no stops alojados en el broker ni protección intradía. Gaps, suspensiones, ausencia de señal horaria y prioridad anti-PDT pueden producir pérdidas superiores a 2.5 ATR. Market orders ejecutan al precio disponible; la tolerancia de pesos reduce rotación, no garantiza un precio de ejecución.
 
 La prohibición de ida y vuelta intradía se conserva como regla operativa solicitada. No se presenta como certificación de cumplimiento normativo universal; las condiciones regulatorias y de cuenta del broker deben verificarse por separado.
 
+## Recuperación de cotizaciones y omisiones
+
+Cada lote puede hacer hasta cuatro consultas, con esperas nominales de 3, 5 y 10 segundos. Todas las fases comparten un presupuesto de 30 segundos de trabajo activo de cotizaciones: consultas, comprobaciones Clock y esperas. El tiempo de fills no consume ese presupuesto. No se reinicia por activo o fase, no hay reintentos ocultos del SDK y un `Retry-After` debe caber en lo que resta. El plazo de órdenes siempre prevalece. Un timeout HTTP no es un límite absoluto del proceso ante DNS o un servidor anómalo; las respuestas que excedan el presupuesto se descartan y la validación final impide usarlas.
+
+Si el runner ya espera, unos cinco minutos antes realiza un preflight de solo lectura, con presupuesto separado de ocho segundos y un intento. Ese diagnóstico no consume el permiso diario ni presta sus precios a la ejecución. Se consultan de nuevo al operar.
+
+| Fallo | Resultado |
+|---|---|
+| Cotización de un candidato swing | Reserva su posible slot y presupuesto; no asciende otro candidato para sustituirlo. Un segundo candidato independiente puede operar. |
+| Precio válido demuestra que un candidato pierde SMA200 | Lo descarta y puede evaluar el siguiente del ranking RSI. |
+| Cotización de una posición existente | Puede salir otra posición válida; bloquea compras nuevas durante esa ejecución. |
+| Cotización de una posición o destino core | Congela el grupo antes de su primera venta; un swing independiente puede continuar si la cartera es valorable. |
+| Fallo tras comenzar órdenes core | Informa core incompleto; las órdenes no son atómicas y puede quedar efectivo. |
+| Permisos, transporte agotado, cuenta, calendario o historial anti-PDT no verificables | Detiene la secuencia. |
+| Orden parcial, rechazada o incierta | Detiene y exige conciliación; no se trata como una omisión de cotizaciones. |
+
+El ranking RSI se fija antes de las órdenes. Tras una omisión no se introduce un reemplazo ni se cambia de fuente. Todas las ventas deben confirmarse y conciliarse antes de comprar. La reserva diaria cubre también una sesión sin órdenes, y no se libera para reintentar un plan parcial.
+
+## Observación paper
+
+**Observe Paper Quotes** se inicia después de **Daily EOD Trading** y puede lanzarse manualmente con un `run_id`. Lee únicamente artifacts JSON de ejecuciones verificadas de este repositorio y datos históricos de Alpaca paper. No crea órdenes, marcadores de trading ni mensajes Telegram.
+
+Conserva la hora real de cada comprobación, tamaños, bid/ask y reintentos. Consulta SIP histórico del mismo instante cuando ya tiene más de quince minutos, aplicando la misma validación de edad, spread y tamaños; el precio retrasado se usa solo para comparar. Si el proveedor rechaza la consulta, se registra la falta de evidencia.
+
+Los artifacts de observación se conservan 90 días y alimentan el acumulado de campaña. La meta inicial es diez fechas distintas y dos evaluaciones semanales. Las sesiones sin precios requeridos cuentan como observación operativa cuando el resumen nuevo lo demuestra, pero no aportan evidencia de cotizaciones. Los resúmenes antiguos sin tiempos comprobables no se inventan ni se completan con una hora aproximada. Compras y ventas posteriores confirmadas se contabilizan por separado: diez sesiones sin fills no validan la ejecución ni la rentabilidad. La campaña ayuda a revisar; no autoriza pasar a dinero real.
+
 ## Resumen, fallos y recuperación
 
-`run_summary.json` contiene estado (`skipped`, `missed_window`, `dry_run`, `completed`, `blocked`, `error`), horario observado/objetivo, régimen, fecha de señal, equity, P&L diario, plan, fills y posiciones protegidas. `P&L = equity − last_equity`: no se ajusta por depósitos o retiros. Un dry-run separa órdenes hipotéticas de fills reales. Webhook envía JSON; Telegram envía texto. Ambos usan HTTPS, límites de tiempo y mensajes de error sin exponer URLs/tokens. La entrega queda registrada en `notification_delivery`; un fallo produce error en Actions, sin revertir órdenes ni provocar nuevas compras.
+`run_summary.json` contiene estado (`skipped`, `missed_window`, `dry_run`, `completed`, `degraded`, `blocked`, `error`), horario observado/objetivo, régimen, fecha de señal, equity, P&L diario, plan, fills y posiciones protegidas. Las incidencias incluyen símbolo, fase, intentos y tiempos exactos, reservas y estado del core. `degraded` significa evaluación terminada con omisiones por datos; no implica ejecución completa del objetivo. Telegram distingue omisiones, falta de operaciones requeridas y órdenes confirmadas. `P&L = equity − last_equity`: no se ajusta por depósitos o retiros. Un dry-run separa órdenes hipotéticas de fills reales. Webhook envía JSON; Telegram envía texto. Ambos usan HTTPS, límites de tiempo y mensajes de error sin exponer URLs/tokens. La entrega queda registrada en `notification_delivery`; un fallo produce error en Actions, sin revertir órdenes ni provocar nuevas compras.
 
 Si hay `unknown_submission`, `cancel_unconfirmed` o ejecución incompleta: revisa órdenes, fills y posiciones directamente en Alpaca. No elimines el marcador diario para forzar otro intento y no vuelvas a ejecutar en otra máquina. El diseño prefiere omitir operaciones a duplicarlas. El marcador se renueva automáticamente para la siguiente fecha; una orden que siga abierta bloqueará la siguiente sesión.
 

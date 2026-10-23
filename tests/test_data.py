@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from src.data import MarketData, quote_price, validate_bars
+from src.quotes import QuoteBudget
 from src.safety import NY, SafetyError, Window
 
 
@@ -222,6 +223,42 @@ class DataLoadTests(unittest.TestCase):
         self.response({"SPY": bars(self.dates)})
         with self.assertRaises(SafetyError):
             self.data.load(("SPY", "QQQ"), self.window, self.broker)
+
+
+class QuoteBatchIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 10, 22, 15, 45, tzinfo=NY)
+        self.data = object.__new__(MarketData)
+        self.data.feed = DataFeed.IEX
+        self.data.client = Mock()
+        self.data.quote_transport = Mock(return_value={
+            "SPY": {"t": self.now.isoformat(), "bp": 99.9, "ap": 100.1, "bs": 10, "as": 20},
+            "SGOV": {"t": (self.now-timedelta(seconds=173)).isoformat(),
+                     "bp": 99.9, "ap": 100.1, "bs": 10, "as": 20},
+        })
+
+    def test_new_batch_api_preserves_symbol_failures_without_sdk_latest_call(self):
+        batch = self.data.quote_batch(("SPY", "SGOV"), lambda: self.now,
+                                     budget=QuoteBudget(max_attempts=1),
+                                     deadline=self.now+timedelta(minutes=10))
+        self.assertEqual(batch.prices, {"SPY": 100})
+        self.assertEqual(batch.failures, {"SGOV": "stale"})
+        self.assertEqual(self.data.quote_transport.call_args.kwargs["feed"], "iex")
+        self.data.client.get_stock_latest_quote.assert_not_called()
+        self.assertEqual(quote_price(batch.quotes["SPY"], self.now, "SPY"), 100)
+        with self.assertRaisesRegex(SafetyError, "stale"):
+            quote_price(batch.quotes["SPY"], self.now+timedelta(seconds=91), "SPY")
+
+    def test_exhausted_budget_does_not_fall_back_to_sdk_or_previous_close(self):
+        clock = Mock(side_effect=AssertionError("No Clock call when budget is exhausted"))
+        batch = self.data.quote_batch(("SPY",), clock, budget=QuoteBudget(seconds=0),
+                                     deadline=self.now+timedelta(minutes=10))
+        self.assertEqual(batch.prices, {})
+        self.assertEqual(batch.failures, {"SPY": "budget_exhausted"})
+        self.assertEqual(batch.quotes, {})
+        self.data.quote_transport.assert_not_called()
+        self.data.client.get_stock_latest_quote.assert_not_called()
+        clock.assert_not_called()
 
 
 if __name__ == "__main__":

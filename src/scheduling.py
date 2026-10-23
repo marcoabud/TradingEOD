@@ -75,6 +75,7 @@ def prepare_start(
     wait_for_window=False,
     sleeper=time.sleep,
     monotonic=time.monotonic,
+    preflight=None,
 ) -> str:
     """Return ready/skipped/missed_window using only broker Clock and Calendar.
 
@@ -85,8 +86,12 @@ def prepare_start(
 
     Waiting is optional, uses sleeps of at most 60 seconds and is bounded by
     330 monotonic minutes. The calendar, session date, target and broker clock
-    are checked again after waiting. This function never claims a trading
-    session and never obtains account data, market signals, or submits orders.
+    are checked again after waiting. An optional read-only preflight(window)
+    callback runs once in the five minutes BEFORE the target, only while
+    waiting. Its failure is recorded separately and never authorizes or blocks
+    the subsequent evaluation. The caller must not submit orders or consume
+    trading claims in this callback. This function itself only reads Clock and
+    Calendar and never obtains account data or submits orders.
     """
     # Clock and Calendar are always the first broker operations.
     clock = broker.clock()
@@ -114,13 +119,35 @@ def prepare_start(
             original_target.isoformat(), (original_target - now).total_seconds() / 60,
             MAX_WAIT_SECONDS // 60,
         )
+        preflight_at = original_target - timedelta(minutes=5)
+        preflight_attempted = False
         while now < original_target:
             elapsed = monotonic() - wait_started
             if not math.isfinite(elapsed) or elapsed < 0:
                 raise SafetyError("Invalid monotonic clock during prestart wait")
             if elapsed >= MAX_WAIT_SECONDS:
                 raise SafetyError("Maximum prestart wait of 330 minutes exhausted")
-            sleeper(min(POLL_SECONDS, (original_target - now).total_seconds(),
+            if preflight is not None and not preflight_attempted and now >= preflight_at and clock.is_open:
+                preflight_attempted = True
+                summary["preflight"] = {"status": "completed", "observed_at": now.isoformat()}
+                try:
+                    preflight(window)
+                except Exception:
+                    # Provider exceptions may contain credentials or URLs. The
+                    # regular evaluation will fetch and validate its own data.
+                    summary["preflight"].update(
+                        status="failed", reason="Preflight failed; regular evaluation will recheck data",
+                    )
+                    LOG.warning("Read-only preflight failed; regular evaluation will recheck data")
+                # A callback can take time. Never sleep or grant ready using the
+                # timestamp observed before it, even when the callback failed.
+                clock = broker.clock()
+                now = _observe(summary, clock, window, scheduled_cron)
+                if now.date() != original_day:
+                    raise SafetyError("New York session date changed during prestart wait")
+                continue
+            next_wake = preflight_at if preflight is not None and now < preflight_at else original_target
+            sleeper(min(POLL_SECONDS, (next_wake - now).total_seconds(),
                         MAX_WAIT_SECONDS - elapsed))
             clock = broker.clock()
             now = _observe(summary, clock, window, scheduled_cron)

@@ -1,0 +1,78 @@
+name: Observe Paper Quotes
+
+on:
+  workflow_run:
+    workflows: ['Daily EOD Trading']
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Completed Daily EOD Trading run ID to audit (read-only)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: paper-observation-${{ github.event.workflow_run.id || inputs.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  observe:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      PYTHONUNBUFFERED: '1'
+      GITHUB_TOKEN: ${{ github.token }}
+      EOD_OBSERVATION_RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+      EOD_OBSERVATION_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt || '' }}
+      # Campaign configuration lives here; manual historical audits never backdate it.
+      EOD_OBSERVATION_START_DATE: '2026-10-23'
+      ALPACA_PAPER: ${{ secrets.ALPACA_PAPER }}
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+    steps:
+      - name: Check out trusted main source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compare recorded quotes with delayed SIP history
+        run: python -m src.observation
+      - name: Preserve read-only observation
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: paper-observation-${{ github.event.workflow_run.id || inputs.run_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: paper_observation_report.json
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Aggregate the ten-session campaign from trusted observation artifacts
+        if: always()
+        timeout-minutes: 4
+        # Reads JSON reports only; no broker or notifier calls. The daily report
+        # is already preserved even if historical collection fails or times out.
+        run: python -m src.observation --campaign
+      - name: Preserve cumulative observation progress
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: paper-observation-campaign-${{ github.run_id }}-${{ github.run_attempt }}
+          path: paper_observation_campaign.json
+          if-no-files-found: warn
+          retention-days: 90

@@ -11,6 +11,7 @@ from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
 
 from .broker import bound_client
+from .quotes import LatestQuoteTransport, QuoteBatch, QuoteBudget, collect_quotes, inspect_quote
 from .safety import NY, SafetyError, aware, midnight
 from .strategy import compute_indicators
 
@@ -35,14 +36,6 @@ def validate_bars(frame, expected_dates, symbol):
     return frame
 
 
-def _quote_number(value):
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return number if np.isfinite(number) else None
-
-
 def _quote_error(symbol, cause, age, bid, ask):
     # Only recognized ticker syntax, numeric fields and fixed cause codes are
     # allowed in diagnostics. Never expose quote objects, URLs or exception text.
@@ -56,39 +49,27 @@ def _quote_error(symbol, cause, age, bid, ask):
 
 
 def quote_price(quote, now, symbol):
-    bid = _quote_number(getattr(quote, "bid_price", None))
-    ask = _quote_number(getattr(quote, "ask_price", None))
-    try:
-        age = (aware(now) - aware(quote.timestamp)).total_seconds()
-    except (AttributeError, TypeError, ValueError, OverflowError, SafetyError):
-        raise _quote_error(symbol, "invalid_timestamp", None, bid, ask) from None
-    if age < -5:
-        raise _quote_error(symbol, "future_timestamp", age, bid, ask)
-    if age > 90:
-        raise _quote_error(symbol, "stale", age, bid, ask)
-    if bid is None or ask is None:
-        raise _quote_error(symbol, "invalid_price", age, bid, ask)
-    if bid <= 0 or ask <= 0:
-        raise _quote_error(symbol, "nonpositive_price", age, bid, ask)
-    if bid > ask:
-        raise _quote_error(symbol, "crossed_market", age, bid, ask)
-    sizes = [_quote_number(getattr(quote, name, None)) for name in ("bid_size", "ask_size")]
-    if any(size is None for size in sizes):
-        raise _quote_error(symbol, "invalid_size", age, bid, ask)
-    if min(sizes) <= 0:
-        raise _quote_error(symbol, "empty_size", age, bid, ask)
-    midpoint = bid / 2 + ask / 2
-    if (ask - bid) / midpoint > 0.005:
-        raise _quote_error(symbol, "excessive_spread", age, bid, ask)
-    return midpoint
+    # Validation thresholds are identical for both feeds. This legacy helper
+    # has no feed selection or transport; the batch API carries provenance.
+    price, cause, diagnostic = inspect_quote(quote, now, feed="iex")
+    if cause is not None:
+        raise _quote_error(symbol, cause, diagnostic["age_seconds"], diagnostic["bid"], diagnostic["ask"])
+    return price
 
 
 class MarketData:
-    def __init__(self, key, secret, feed="sip"):
+    def __init__(self, key, secret, feed="sip", *, quote_transport=None):
         if feed not in ("sip", "iex"):
             raise SafetyError("ALPACA_DATA_FEED must be sip or iex")
         self.feed = DataFeed(feed)
         self.client = bound_client(StockHistoricalDataClient(key, secret))
+        self.quote_transport = (quote_transport if quote_transport is not None
+                                else LatestQuoteTransport(key, secret))
+
+    def quote_batch(self, symbols, now, *, budget: QuoteBudget, deadline) -> QuoteBatch:
+        """Use a shared active-time budget; preserve failures per symbol."""
+        return collect_quotes(symbols, now, feed=self.feed.value, transport=self.quote_transport,
+                              budget=budget, deadline=deadline)
 
     def prices(self, symbols, now):
         symbols = list(symbols)

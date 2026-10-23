@@ -20,6 +20,8 @@ htmlcov/
 run_summary.json
 connectivity_summary.json
 market_data_summary.json
+paper_observation_report.json
+paper_observation_campaign.json
 *.log
 .eod.lock
 .DS_Store

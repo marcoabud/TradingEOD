@@ -124,8 +124,9 @@ class Broker:
         clock = self.clock()
         if not clock.is_open or not window.accepts_order(clock.timestamp):
             raise SafetyError("Order deadline reached or market closed")
+        return clock.timestamp
 
-    def execute(self, *, symbol, side, amount, window, summary, sleeper=time.sleep):
+    def execute(self, *, symbol, side, amount, window, summary, sleeper=time.sleep, pre_submit=None):
         """Return only on full fill. A partial/rejected/uncertain order aborts run."""
         from uuid import UUID
         from alpaca.trading.enums import OrderStatus
@@ -139,7 +140,17 @@ class Broker:
                 raise SafetyError("Sell exceeds verified long position")
         elif symbol in self.traded_symbols(window.day, "sell"):
             raise SafetyError(f"Same-session reentry blocked: {symbol}")
-        self.assert_time(window)
+        submission_time = self.assert_time(window)
+        if pre_submit is not None:
+            # The callback must be local validation only. Recheck quotes using
+            # the final Alpaca clock after FILL/position reads, without adding
+            # another network request between validation and submission.
+            try:
+                pre_submit(submission_time)
+            except SafetyError:
+                raise
+            except Exception:
+                raise SafetyError("Pre-submission validation failed") from None
         client_id = f"eod-v1-{window.day:%Y%m%d}-{side[0]}-{symbol.replace('.', '')}"
         fields = {"qty": float(quantity(amount))} if side == "sell" else {"notional": float(amount)}
         req = MarketOrderRequest(symbol=symbol, side=OrderSide(side),

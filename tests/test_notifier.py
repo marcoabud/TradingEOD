@@ -1,6 +1,7 @@
 """Notification network calls are mocked; these tests never send messages."""
 
 import unittest
+import json
 from decimal import Decimal
 from unittest.mock import Mock
 
@@ -99,6 +100,93 @@ class NotifierTests(unittest.TestCase):
             self.assertFalse(self.send({"WEBHOOK_URL": "https://example.com/private-token"})["webhook"])
         self.assertEqual(self.session.post.call_count, 3)
         self.assertNotIn("private-token", " ".join(logs.output))
+
+    def test_degradation_fields_and_issues_are_allowlisted_and_redacted(self):
+        secret = "123:private-telegram-token"
+        self.summary.update(
+            status="degraded", reserved_cash="600.00", reserved_slots=1,
+            core_status="held " + secret, buy_blocked=True,
+            evaluation_outcome="data_limited " + secret,
+            data_issues=[{
+                "symbol": "JPM", "phase": "entry", "reason": "stale " + secret,
+                "attempts": 3, "response": "private response", "url": "private URL",
+            }],
+            raw_quotes={"JPM": "private quote"},
+        )
+        self.send({"WEBHOOK_URL": "https://example.com/hook", "TELEGRAM_TRADINGEOD": " " + secret + " "})
+        payload = self.session.post.call_args.kwargs["json"]
+        self.assertEqual(payload["status"], "degraded")
+        self.assertEqual(payload["reserved_cash"], "600.00")
+        self.assertEqual(payload["reserved_slots"], 1)
+        self.assertIs(payload["buy_blocked"], True)
+        self.assertEqual(payload["data_issues"], [{
+            "symbol": "JPM", "phase": "entry", "reason": "stale [REDACTED]", "attempts": 3,
+        }])
+        serialized = json.dumps(payload)
+        for private in (secret, "private response", "private URL", "private quote"):
+            self.assertNotIn(private, serialized)
+        self.assertIn("[REDACTED]", payload["core_status"])
+        self.assertIn("[REDACTED]", payload["evaluation_outcome"])
+
+    def test_nested_untrusted_issue_data_is_not_serialized(self):
+        self.summary["data_issues"] = ["not an issue", {
+            "symbol": "JPM", "phase": {"raw": "private-data"},
+            "reason": RuntimeError("private-data"), "attempts": 10**100,
+        }]
+        self.send({"WEBHOOK_URL": "https://example.com/hook"})
+        payload = self.session.post.call_args.kwargs["json"]
+        self.assertEqual(payload["data_issues"], [{
+            "symbol": "JPM", "phase": None, "reason": None, "attempts": None,
+        }])
+        self.assertNotIn("private-data", json.dumps(payload))
+
+    def test_issue_lists_and_strings_are_bounded(self):
+        self.summary["data_issues"] = [{"symbol": "JPM", "reason": "x" * 1000}] * 100
+        self.summary["orders"] *= 100
+        self.send({"WEBHOOK_URL": "https://example.com/hook"})
+        payload = self.session.post.call_args.kwargs["json"]
+        self.assertEqual(len(payload["data_issues"]), 50)
+        self.assertEqual(len(payload["orders"]), 50)
+        self.assertEqual(len(payload["data_issues"][0]["reason"]), 500)
+
+    def test_telegram_degradation_summary_is_readable_and_preserves_order_status(self):
+        self.summary.update(
+            status="degraded", reserved_cash="600.00", reserved_slots=1,
+            buy_blocked=False, core_status="unchanged", evaluation_outcome="completed",
+            data_issues=[{"symbol": "JPM", "phase": "entry", "reason": "stale", "attempts": 3}],
+        )
+        self.send({"TELEGRAM_BOT_TOKEN": "123:abc", "TELEGRAM_CHAT_ID": "456"})
+        text = self.session.post.call_args.kwargs["json"]["text"]
+        for expected in ("Ejecución limitada por datos", "Evaluación completada", "Estado Core: unchanged",
+                         "Efectivo reservado USD: 600.00", "Slots reservados: 1",
+                         "Compras bloqueadas por datos: no", "JPM [entry]: stale (intentos: 3)", "filled"):
+            self.assertIn(expected, text)
+
+    def test_no_signals_has_distinct_evaluation_text(self):
+        self.summary.update(status="completed", evaluation_outcome="no_signals", orders=[])
+        self.send({"TELEGRAM_BOT_TOKEN": "123:abc", "TELEGRAM_CHAT_ID": "456"})
+        text = self.session.post.call_args.kwargs["json"]["text"]
+        self.assertIn("Sin señales operables", text)
+        self.assertIn("Sin órdenes ejecutadas", text)
+
+    def test_order_failure_is_not_relabelled_as_degraded_when_data_issues_exist(self):
+        self.summary.update(status="blocked", buy_blocked=True, data_issues=[{"symbol": "JPM", "reason": "stale"}])
+        self.summary["orders"][0]["status"] = "partially_filled"
+        self.send({"TELEGRAM_BOT_TOKEN": "123:abc", "TELEGRAM_CHAT_ID": "456"})
+        text = self.session.post.call_args.kwargs["json"]["text"]
+        self.assertIn("TradingEOD | Bloqueado", text)
+        self.assertIn("partially_filled", text)
+        self.assertNotIn("Ejecución limitada por datos", text)
+
+    def test_telegram_issue_details_remain_within_message_limit(self):
+        self.summary.update(orders=[], data_issues=[{
+            "symbol": "JPM", "phase": "entry", "reason": "x" * 1000, "attempts": 3,
+        }] * 100)
+        self.send({"TELEGRAM_BOT_TOKEN": "123:abc", "TELEGRAM_CHAT_ID": "456"})
+        text = self.session.post.call_args.kwargs["json"]["text"]
+        self.assertLessEqual(len(text), 3900)
+        self.assertEqual(text.count("JPM [entry]"), 8)
+        self.assertIn("Otras 42 incidencias", text)
 
 
 if __name__ == "__main__":

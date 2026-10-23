@@ -47,6 +47,17 @@ class ScopedData(FakeData):
             raise SafetyError(f"{sorted(invalid)[0]}: synthetic invalid quote")
         return {symbol: self.values[symbol].price for symbol in symbols}
 
+    def quote_batch(self, symbols, now, *, budget, deadline):
+        from src.quotes import QuoteBatch, QuoteSnapshot
+        symbols = tuple(symbols)
+        bad = set(symbols) & self.invalid_quotes
+        prices = self.prices([s for s in symbols if s not in bad], now)
+        self.quote_requests[-1] = symbols
+        timestamp = now()
+        return QuoteBatch(prices=prices, failures={s: "stale" for s in bad},
+                          quotes={s: QuoteSnapshot(timestamp, p, p, 10, 10) for s, p in prices.items()},
+                          diagnostics={s: {"checked_at": timestamp.isoformat(), "attempts": 1} for s in symbols})
+
 
 class ReconciledHoldingBroker(FakeBroker):
     """A position newly visible in the post-sale reconciliation needs a quote."""
@@ -101,21 +112,23 @@ class QuoteScopeTests(unittest.TestCase):
         values["JPM"] = replace(values["JPM"], rsi2=5)
         data = ScopedData(values, invalid_quotes={"JPM"})
         broker, claim = FakeBroker(now=at_start(WEDNESDAY)), Mock(return_value=True)
-        with self.assertRaisesRegex(SafetyError, "JPM: synthetic invalid quote"):
-            self.run_bot(broker, data, claim=claim)
-        self.assertEqual(data.quote_requests, [("JPM",)])
-        claim.assert_not_called()
+        summary, _, _ = self.run_bot(broker, data, claim=claim)
+        self.assertEqual(summary["status"], "degraded")
+        self.assertEqual(summary["reserved_symbols"], ["JPM"])
+        self.assertIn(("JPM",), data.quote_requests)
+        claim.assert_called_once()
         self.assertEqual(broker.executed, [])
 
-    def test_wednesday_existing_sgov_holding_requires_valid_quote_before_claim(self):
+    def test_wednesday_existing_sgov_bad_quote_blocks_buys_and_records_omission(self):
         broker = FakeBroker(now=at_start(WEDNESDAY), holdings={"SGOV": position("SGOV", 1)})
         data = ScopedData(invalid_quotes={"SGOV"})
         observe, claim = Mock(return_value=True), Mock(return_value=True)
-        with self.assertRaisesRegex(SafetyError, "SGOV: synthetic invalid quote"):
-            self.run_bot(broker, data, observe=observe, claim=claim)
+        summary, _, _ = self.run_bot(broker, data, observe=observe, claim=claim)
+        self.assertEqual(summary["status"], "degraded")
+        self.assertTrue(summary["buy_blocked"])
         self.assertIn("SGOV", data.quote_requests[0])
         observe.assert_called_once()
-        claim.assert_not_called()
+        claim.assert_called_once()
         self.assertEqual(broker.executed, [])
 
     def test_friday_risk_on_uses_sgov_history_without_quote_and_still_buys_core(self):
@@ -143,10 +156,11 @@ class QuoteScopeTests(unittest.TestCase):
         broker = FakeBroker(now=at_start(FRIDAY))
         data = ScopedData(values, invalid_quotes={"SGOV"})
         claim = Mock(return_value=True)
-        with self.assertRaisesRegex(SafetyError, "SGOV: synthetic invalid quote"):
-            self.run_bot(broker, data, claim=claim)
+        summary, _, _ = self.run_bot(broker, data, claim=claim)
+        self.assertEqual(summary["status"], "degraded")
+        self.assertEqual(summary["core_status"], "frozen")
         self.assertEqual(set(data.quote_requests[0]), {"SGOV"})
-        claim.assert_not_called()
+        claim.assert_called_once()
         self.assertEqual(broker.executed, [])
 
     def test_friday_risk_off_valid_quote_allows_defensive_target(self):
@@ -179,7 +193,7 @@ class QuoteScopeTests(unittest.TestCase):
         broker = FakeBroker(now=at_start(WEDNESDAY), holdings={"AAPL": position("AAPL", 1)})
         data = ScopedData(values)
         summary, _, _ = self.run_bot(broker, data)
-        self.assertEqual(data.quote_requests, [("AAPL",), ()])
+        self.assertEqual(data.quote_requests, [("AAPL",), ("AAPL",), ()])
         self.assertEqual(summary["status"], "completed")
         self.assertEqual(summary["quoted_symbols"], [])
         self.assertIsNone(summary["indicators"]["AAPL"]["price"])
@@ -205,8 +219,9 @@ class QuoteScopeTests(unittest.TestCase):
         broker = ReconciledHoldingBroker()
         data = ScopedData(invalid_quotes={"SGOV"})
         claim = Mock(return_value=True)
-        with self.assertRaisesRegex(SafetyError, "SGOV: synthetic invalid quote"):
-            self.run_bot(broker, data, claim=claim)
+        summary, _, _ = self.run_bot(broker, data, claim=claim)
+        self.assertEqual(summary["status"], "degraded")
+        self.assertTrue(summary["buy_blocked"])
         self.assertNotIn("SGOV", data.quote_requests[0])
         self.assertIn("SGOV", data.quote_requests[1])
         claim.assert_called_once()  # The order barrier had been reached before reconciliation.
@@ -237,9 +252,13 @@ class EvaluationAttemptIntegrationTests(unittest.TestCase):
                 account, day, paper, environ=env,
             ))
             broker = FakeBroker(now=at_start(WEDNESDAY), holdings={"SGOV": position("SGOV", 1)})
-            data = ScopedData(invalid_quotes={"SGOV"})
+            class UnavailableData(ScopedData):
+                def quote_batch(self, *args, **kwargs):
+                    from src.quotes import QuoteFatalError
+                    raise QuoteFatalError("permission")
+            data = UnavailableData()
             summary = {}
-            with self.assertRaisesRegex(SafetyError, "SGOV: synthetic invalid quote"):
+            with self.assertRaisesRegex(SafetyError, "Quote service unavailable: permission"):
                 run(Config("synthetic-key", "synthetic-secret", True, False, "iex"),
                     broker, data, summary, claim=claim, observe=observe)
             self.assertTrue(summary["evaluation_recorded"])

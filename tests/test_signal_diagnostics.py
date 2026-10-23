@@ -27,8 +27,16 @@ class SignalDiagnosticTests(unittest.TestCase):
                                      data_factory=self.data_factory)
         self.assertEqual(self.broker.account_calls, 0)
         self.assertEqual(self.broker.executed, [])
+        self.assertFalse(set(self.broker.trace) & {"positions", "orders", "traded_buy", "traded_sell"})
         self.data.prices.assert_not_called()
+        self.data.quote_batch.assert_not_called()
         return result
+
+    def quote(self, symbol, price=100):
+        self.report["historical_iex"][symbol] = {
+            "timestamp": self.report["reconstruction_time"],
+            "bid_price": price-.1, "ask_price": price+.1, "bid_size": 10, "ask_size": 10,
+        }
 
     def test_no_oversold_signals_need_no_quote_and_do_not_become_orders(self):
         result = self.invoke()
@@ -50,12 +58,75 @@ class SignalDiagnosticTests(unittest.TestCase):
         self.assertEqual(result["required_quotes"], ["AAPL"])
         self.assertEqual(result["hypothetical_swing_entries"], ["AAPL"])
 
-    def test_missing_required_quote_blocks_without_falling_back_to_daily_close(self):
+    def test_missing_candidate_quote_reserves_slot_without_using_daily_close(self):
         self.values["JPM"] = replace(self.values["JPM"], rsi2=5)
         result = self.invoke()
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["status"], "degraded")
         self.assertIn("JPM", result["quote_failures"])
-        self.assertNotIn("hypothetical_swing_entries", result)
+        self.assertEqual(result["hypothetical_swing_entries"], [])
+        self.assertEqual(result["reserved_symbols"], ["JPM"])
+        self.assertEqual(result["reserved_slots"], 1)
+        self.assertEqual(result["reserved_equity_weight"], .15)
+
+    def test_invalid_top_candidate_reserves_slot_and_keeps_independent_second(self):
+        for rsi, symbol in enumerate(("AAPL", "MSFT", "NVDA"), 1):
+            self.values[symbol] = replace(self.values[symbol], rsi2=rsi)
+        self.quote("MSFT")
+        self.quote("NVDA")
+        result = self.invoke()
+        self.assertEqual(result["status"], "degraded")
+        self.assertEqual(result["hypothetical_swing_entries"], ["MSFT"])
+        self.assertEqual(result["reserved_symbols"], ["AAPL"])
+        self.assertEqual(result["required_quotes"], ["AAPL", "MSFT"])
+
+    def test_confirmed_below_sma_candidate_releases_slot_for_next_rank(self):
+        for rsi, symbol in enumerate(("AAPL", "MSFT", "NVDA"), 1):
+            self.values[symbol] = replace(self.values[symbol], rsi2=rsi)
+        self.quote("AAPL", 80)
+        self.quote("MSFT")
+        self.quote("NVDA")
+        result = self.invoke()
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["hypothetical_swing_entries"], ["MSFT", "NVDA"])
+        self.assertEqual(result["reserved_slots"], 0)
+        self.assertEqual(result["required_quotes"], ["AAPL", "MSFT", "NVDA"])
+
+    def test_unused_quote_failure_does_not_degrade_hypothetical_plan(self):
+        self.report["historical_iex"]["SGOV"] = {"http_status": 403}
+        self.assertEqual(self.invoke()["status"], "completed")
+
+    def test_core_quote_failure_freezes_core_but_keeps_independent_swing(self):
+        self.report.update(session_date="2026-10-23", reconstruction_time="2026-10-23T15:45:03-04:00")
+        self.values["META"] = replace(self.values["META"], rsi2=5)
+        self.quote("SPY")
+        self.quote("META")
+        result = self.invoke()
+        self.assertEqual(result["status"], "degraded")
+        self.assertEqual(result["core_status"], "frozen")
+        self.assertEqual(result["hypothetical_core_targets"], {})
+        self.assertEqual(result["hypothetical_core_signal_targets"], {"SPY": .35, "QQQ": .35})
+        self.assertEqual(result["hypothetical_swing_entries"], ["META"])
+        self.assertEqual(result["reserved_slots"], 0)
+
+    def test_candidate_failure_does_not_freeze_valid_core(self):
+        self.report.update(session_date="2026-10-23", reconstruction_time="2026-10-23T15:45:03-04:00")
+        self.values["META"] = replace(self.values["META"], rsi2=5)
+        self.quote("SPY")
+        self.quote("QQQ")
+        result = self.invoke()
+        self.assertEqual(result["status"], "degraded")
+        self.assertEqual(result["core_status"], "ready")
+        self.assertEqual(result["hypothetical_core_targets"], {"SPY": .35, "QQQ": .35})
+        self.assertEqual(result["reserved_symbols"], ["META"])
+
+    def test_required_provider_or_shape_failures_still_block_replay(self):
+        self.values["META"] = replace(self.values["META"], rsi2=5)
+        for quote in ({"http_status": 403}, {"error": "request_timeout"}, []):
+            with self.subTest(quote=quote):
+                self.report["historical_iex"]["META"] = quote
+                result = self.invoke()
+                self.assertEqual(result["status"], "blocked")
+                self.assertNotIn("hypothetical_swing_entries", result)
 
     def test_live_setting_rejected_before_creating_clients(self):
         self.env["ALPACA_PAPER"] = "false"

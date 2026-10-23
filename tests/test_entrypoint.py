@@ -89,7 +89,8 @@ class EntrypointTests(unittest.TestCase):
         code, summary = self.invoke()
         self.assertEqual(code, 0)
         self.preflight.assert_called_once()
-        self.assertEqual(self.preflight.call_args.kwargs, {
+        self.assertTrue(callable(self.preflight.call_args.kwargs["preflight"]))
+        self.assertEqual({k:v for k,v in self.preflight.call_args.kwargs.items() if k != "preflight"}, {
             "event_name": "schedule", "scheduled_cron": "45 19 * * 1-5", "wait_for_window": True,
         })
         self.data_factory.assert_called_once_with("synthetic-key", "synthetic-secret", "iex")

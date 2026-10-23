@@ -77,7 +77,9 @@ class FakeBroker:
     def assert_time(self, window):
         self.trace.append("time")
 
-    def execute(self, *, symbol, side, amount, window, summary):
+    def execute(self, *, symbol, side, amount, window, summary, pre_submit=None):
+        if pre_submit is not None:
+            pre_submit(self.now)
         self.trace.append(f"execute_{side}_{symbol}")
         if side == "sell" and self.fail_sell:
             raise SafetyError("Unconfirmed/partial sell")
@@ -111,6 +113,14 @@ class FakeData:
     def prices(self, symbols, now):
         self.price_calls += 1
         return {s: self.values[s].price for s in symbols}
+
+    def quote_batch(self, symbols, now, *, budget, deadline):
+        from src.quotes import QuoteBatch, QuoteSnapshot
+        timestamp = now()
+        prices = self.prices(symbols, now)
+        snapshots = {s: QuoteSnapshot(timestamp, p, p, 10, 10) for s, p in prices.items()}
+        return QuoteBatch(prices=prices, quotes=snapshots,
+                          diagnostics={s: {"checked_at": timestamp.isoformat(), "attempts": 1} for s in prices})
 
 
 class PlanningTests(unittest.TestCase):

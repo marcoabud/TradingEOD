@@ -63,6 +63,13 @@ def block_value(positions, symbols, indicators):
     return sum((position_value(p, indicators) for s, p in positions.items() if s in symbols), ZERO)
 
 
+def reserved_cash_amount(positions, indicators, equity, cash, reserved_slots):
+    if isinstance(reserved_slots, bool) or not isinstance(reserved_slots, int) or not 0 <= reserved_slots <= 2:
+        raise SafetyError("Reserved swing slots must be between zero and two")
+    room = max(ZERO, SWING_WEIGHT*equity - block_value(positions, SWING_UNIVERSE, indicators))
+    return money(min(max(ZERO, money(cash-CASH_BUFFER)), room, SLOT_WEIGHT*equity*reserved_slots))
+
+
 def assert_portfolio(positions):
     unknown = set(positions) - set(UNIVERSE)
     if unknown:
@@ -102,9 +109,13 @@ def plan_sells(positions, indicators, equity, decision, bought_today):
     return sells, core_buys, protected
 
 
-def plan_buys(positions, indicators, equity, cash, decision, core_buys, excluded):
+def plan_buys(positions, indicators, equity, cash, decision, core_buys, excluded, *,
+              entry_symbols=None, reserved_slots=0):
     """No leverage, no slot overbooking, no shifting unused alpha cash into core."""
     remaining = max(ZERO, money(cash - CASH_BUFFER))
+    swing_room = max(ZERO, SWING_WEIGHT*equity - block_value(positions, SWING_UNIVERSE, indicators))
+    reserved = reserved_cash_amount(positions, indicators, equity, cash, reserved_slots)
+    remaining -= reserved
     plan = []
     core_room = max(ZERO, CORE_WEIGHT*equity - block_value(positions, CORE, indicators))
     if decision:
@@ -119,8 +130,11 @@ def plan_buys(positions, indicators, equity, cash, decision, core_buys, excluded
                 remaining -= amount
                 core_room -= amount
     held = set(positions) & set(SWING_UNIVERSE)
-    swing_room = max(ZERO, SWING_WEIGHT*equity - block_value(positions, SWING_UNIVERSE, indicators))
-    candidates = swing_entries(indicators, held, excluded_symbols=excluded)
+    swing_room = max(ZERO, SWING_WEIGHT*equity - block_value(positions, SWING_UNIVERSE, indicators) - reserved)
+    candidates = (swing_entries(indicators, held, excluded_symbols=excluded) if entry_symbols is None else
+                  [s for s in entry_symbols if s not in held and s not in excluded
+                   and indicators[s].rsi2 < 10 and require_current_price(indicators[s]) > indicators[s].sma200]
+                  [:max(0, 2-len(held)-reserved_slots)])
     for symbol in candidates:
         amount = money(min(SLOT_WEIGHT*equity, swing_room, remaining))
         if amount >= MIN_BUY:
@@ -196,84 +210,12 @@ def run(config, broker, data, summary, claim=claim_session, observe=None):
     broker.assert_assets(UNIVERSE)
     indicators = data.load(UNIVERSE, window, broker, quote_symbols=())
     decision = core_targets(indicators) if window.weekly_rebalance else None
-    indicators = refresh_indicators(indicators, data, broker, positions, decision)
-    snapshot_indicators(summary, indicators)
     summary.update(regime=decision.regime if decision else "HOLD_UNTIL_WEEK_END",
                    core_targets=decision.targets if decision else {},
                    core_scores=decision.scores if decision else {},
                    signal_as_of=indicators["SPY"].as_of)
-    bought_today = broker.traded_symbols(day, "buy")
-    sold_today = broker.traded_symbols(day, "sell")
-    sells, core_buys, protected = plan_sells(positions, indicators, equity, decision, bought_today)
-    summary["protected"] = protected
-    summary["planned_orders"] = [{"symbol": s, "side": "sell", **v} for s, v in sells.items()]
-    broker.assert_time(window)
-    if config.dry_run:
-        # Hypothetical post-sale cash is labelled and never treated as an actual fill.
-        simulated_positions = dict(positions)
-        cash = usable_cash(account)
-        for symbol, sale in sells.items():
-            p = simulated_positions[symbol]
-            cash += sale["qty"] * decimal(indicators[symbol].price)
-            left = decimal(p.qty) - sale["qty"]
-            if left <= 0:
-                del simulated_positions[symbol]
-            else:
-                from types import SimpleNamespace
-                simulated_positions[symbol] = SimpleNamespace(symbol=symbol, qty=left, avg_entry_price=p.avg_entry_price)
-        buys = plan_buys(simulated_positions, indicators, equity, cash, decision, core_buys,
-                         bought_today | sold_today | set(sells))
-        summary["planned_orders"] += [{"side": "buy", **b} for b in buys]
-        summary.update(status="dry_run", reason="Hypothetical plan only; fills and proceeds are estimates")
-        return
-    if not claim(account.id, day, config.paper):
-        summary["reason"] = "Persistent daily claim already exists; no same-day retry"
-        return
-    summary["session_claimed"] = True
-    original_quantities = {s: decimal(p.qty) for s, p in positions.items()}
-    # Strict phase barrier: any exception/partial/unknown sell aborts before buys.
-    for symbol, sale in sells.items():
-        broker.execute(symbol=symbol, side="sell", amount=sale["qty"], window=window, summary=summary)
-        LOG.info("SELL confirmed: %s", symbol)
-    broker.assert_no_open_orders()
-    positions = broker.positions()
-    for symbol, sale in sells.items():
-        actual = decimal(positions[symbol].qty) if symbol in positions else ZERO
-        if actual > original_quantities[symbol] - sale["qty"]:
-            raise SafetyError(f"Position has not reconciled after sale: {symbol}")
-        # A full exit must actually release its position before a slot can be reused.
-        if symbol in SWING_UNIVERSE and symbol in positions:
-            raise SafetyError(f"Swing position remains after confirmed exit: {symbol}")
-    assert_portfolio(positions)
-    indicators = refresh_indicators(indicators, data, broker, positions, decision)
-    snapshot_indicators(summary, indicators)
-    account = broker.account()
-    validate_account(account)
-    excluded = broker.traded_symbols(day, "buy") | broker.traded_symbols(day, "sell") | set(sells)
-    buys = plan_buys(positions, indicators, decimal(account.equity), usable_cash(account),
-                     decision, core_buys, excluded)
-    summary["planned_orders"] += [{"side": "buy", **b} for b in buys]
-    for buy in buys:
-        # Reconcile actual cash, holdings and latest price before EACH buy.
-        account = broker.account()
-        validate_account(account)
-        positions = broker.positions()
-        assert_portfolio(positions)
-        indicators = refresh_indicators(indicators, data, broker, positions, decision)
-        snapshot_indicators(summary, indicators)
-        updated = plan_buys(positions, indicators, decimal(account.equity), usable_cash(account),
-                            decision, core_buys, excluded)
-        match = next((p for p in updated if p["symbol"] == buy["symbol"]), None)
-        if match is None:
-            continue
-        amount = min(buy["notional"], match["notional"])
-        broker.execute(symbol=buy["symbol"], side="buy", amount=amount, window=window, summary=summary)
-        excluded.add(buy["symbol"])
-        LOG.info("BUY confirmed: %s USD %s", buy["symbol"], amount)
-    account = broker.account()
-    summary.update(status="completed", equity=str(account.equity),
-                   pnl_day=str(decimal(account.equity)-decimal(account.last_equity)),
-                   cash_remaining=str(account.cash), reason="Execution complete")
+    from .execution import execute_strategy
+    execute_strategy(config, broker, data, summary, window, account, positions, indicators, decision, claim)
 
 
 def main():
@@ -285,10 +227,17 @@ def main():
         summary.update(mode="paper" if config.paper else "live", dry_run=config.dry_run,
                        data_feed=config.feed, regime="NOT_EVALUATED")
         broker = Broker(config.key, config.secret, config.paper)
+        # A separate read-only probe never contributes quotes to execution.
+        def preflight(window):
+            from .quotes import QuoteBudget
+            probe = MarketData(config.key, config.secret, config.feed)
+            batch = probe.quote_batch(UNIVERSE, lambda: broker.clock().timestamp,
+                                      budget=QuoteBudget(seconds=8, max_attempts=1), deadline=window.target)
+            summary["preflight_quotes"] = {"failures": batch.failures, "diagnostics": batch.diagnostics}
         outcome = prepare_start(
             broker, summary, event_name=os.environ.get("GITHUB_EVENT_NAME", ""),
             scheduled_cron=os.environ.get("EOD_SCHEDULED_CRON", ""),
-            wait_for_window=bool_env(os.environ, "EOD_WAIT_FOR_WINDOW", False),
+            wait_for_window=bool_env(os.environ, "EOD_WAIT_FOR_WINDOW", False), preflight=preflight,
         )
         if outcome == "ready":
             summary["prestart_approved"] = True

@@ -18,7 +18,8 @@ import requests
 LOGGER = logging.getLogger(__name__)
 RETRY_STATUSES = frozenset({429, 502, 503, 504})
 SUMMARY_FIELDS = (
-    "status", "session_date", "mode", "regime", "equity", "pnl_day", "reason"
+    "status", "session_date", "mode", "regime", "equity", "pnl_day", "reason",
+    "reserved_cash", "reserved_slots", "core_status", "buy_blocked", "evaluation_outcome",
 )
 ORDER_FIELDS = (
     "symbol", "side", "status", "notional", "qty", "filled_qty",
@@ -26,8 +27,10 @@ ORDER_FIELDS = (
 )
 SECRET_FIELDS = (
     "ALPACA_API_KEY", "ALPACA_SECRET_KEY", "WEBHOOK_URL", "TELEGRAM_BOT_TOKEN",
-    "GITHUB_TOKEN", "GH_TOKEN",
+    "TELEGRAM_TRADINGEOD", "TELEGRAM_CHAT_ID", "GITHUB_TOKEN", "GH_TOKEN",
 )
+ISSUE_FIELDS = ("symbol", "phase", "reason", "attempts")
+MAX_ITEMS = 50
 
 
 def _scalar(value: Any, secrets: tuple[str, ...]) -> str | int | float | bool | None:
@@ -39,7 +42,7 @@ def _scalar(value: Any, secrets: tuple[str, ...]) -> str | int | float | bool | 
     if isinstance(value, (Decimal, date, datetime)):
         value = str(value)
     if isinstance(value, int):
-        return value
+        return value if abs(value) <= 10**18 else None
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if not isinstance(value, str):
@@ -50,7 +53,9 @@ def _scalar(value: Any, secrets: tuple[str, ...]) -> str | int | float | bool | 
 
 
 def _payload(summary: Mapping[str, Any], environ: Mapping[str, str]) -> dict[str, Any]:
-    secrets = tuple(environ[key] for key in SECRET_FIELDS if environ.get(key))
+    secrets = tuple(sorted({value for key in SECRET_FIELDS if environ.get(key)
+                            for value in (environ[key], environ[key].strip()) if value},
+                           key=len, reverse=True))
     payload = {
         key: _scalar(summary.get(key), secrets)
         for key in SUMMARY_FIELDS if key in summary
@@ -60,15 +65,28 @@ def _payload(summary: Mapping[str, Any], environ: Mapping[str, str]) -> dict[str
         orders = []
     payload["orders"] = [
         {key: _scalar(order[key], secrets) for key in ORDER_FIELDS if key in order}
-        for order in orders[:50] if isinstance(order, Mapping)
+        for order in orders[:MAX_ITEMS] if isinstance(order, Mapping)
+    ]
+    issues = summary.get("data_issues", [])
+    if not isinstance(issues, (list, tuple)):
+        issues = []
+    payload["data_issues"] = [
+        {key: _scalar(issue[key], secrets) for key in ISSUE_FIELDS if key in issue}
+        for issue in issues[:MAX_ITEMS] if isinstance(issue, Mapping)
     ]
     payload["source"] = "TradingEOD"
     return payload
 
 
 def _telegram_text(payload: Mapping[str, Any]) -> str:
+    status = payload.get("status", "unknown")
+    status_label = {
+        "completed": "Completado", "degraded": "Ejecución limitada por datos",
+        "blocked": "Bloqueado", "error": "Error", "dry_run": "Simulación",
+        "missed_window": "Ventana EOD perdida", "skipped": "Omitido",
+    }.get(status, str(status))
     lines = [
-        "TradingEOD | " + str(payload.get("status", "unknown")),
+        "TradingEOD | " + status_label,
         "Fecha: " + str(payload.get("session_date", "n/a")),
         "Modo: " + str(payload.get("mode", "n/a")),
         "Régimen: " + str(payload.get("regime", "n/a")),
@@ -77,6 +95,30 @@ def _telegram_text(payload: Mapping[str, Any]) -> str:
     ]
     if payload.get("reason"):
         lines.append("Detalle: " + str(payload["reason"]))
+    if payload.get("evaluation_outcome"):
+        outcome = payload["evaluation_outcome"]
+        outcome_label = {
+            "no_signals": "Sin señales operables", "completed": "Evaluación completada",
+            "no_orders_required": "Sin operaciones requeridas por señales y cartera",
+            "orders_confirmed": "Órdenes confirmadas", "data_omissions": "Operaciones omitidas por datos",
+            "planned": "Plan simulado", "degraded": "Plan simulado con datos insuficientes",
+            "evaluating": "Evaluación interrumpida",
+        }.get(outcome, str(outcome))
+        lines.append("Evaluación: " + outcome_label)
+    if payload.get("core_status"):
+        core = payload["core_status"]
+        core_label = {
+            "not_due": "Sin rebalanceo semanal hoy", "ready": "Pendiente",
+            "frozen": "Suspendido por datos", "incomplete": "Rebalanceo incompleto",
+            "completed": "Evaluación semanal completada",
+        }.get(core, str(core))
+        lines.append("Estado Core: " + core_label)
+    if "reserved_cash" in payload:
+        lines.append("Efectivo reservado USD: " + str(payload["reserved_cash"]))
+    if "reserved_slots" in payload:
+        lines.append("Slots reservados: " + str(payload["reserved_slots"]))
+    if isinstance(payload.get("buy_blocked"), bool):
+        lines.append("Compras bloqueadas por datos: " + ("sí" if payload["buy_blocked"] else "no"))
     for order in payload.get("orders", []):
         lines.append(" | ".join(
             str(order.get(key, ""))
@@ -84,6 +126,16 @@ def _telegram_text(payload: Mapping[str, Any]) -> str:
         ))
     if not payload.get("orders"):
         lines.append("Sin órdenes ejecutadas.")
+    issues = payload.get("data_issues", [])
+    if issues:
+        lines.append("Incidencias de datos:")
+        for issue in issues[:8]:
+            lines.append(
+                f"{issue.get('symbol', 'n/a')} [{issue.get('phase', 'n/a')}]: "
+                f"{str(issue.get('reason', 'n/a'))[:160]} (intentos: {issue.get('attempts', 'n/a')})"
+            )
+        if len(issues) > 8:
+            lines.append(f"Otras {len(issues) - 8} incidencias; consultar el resumen de ejecución.")
     # Telegram's text limit is 4096 characters; leave room for future metadata.
     return "\n".join(lines)[:3900]
 
