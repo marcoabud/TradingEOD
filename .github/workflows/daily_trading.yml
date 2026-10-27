@@ -2,16 +2,17 @@ name: Daily EOD Trading
 
 on:
   schedule:
-    # Start early and wait on Alpaca's clock. Distinct rows identify the DST family.
+    # Nominal DST families. Any known trigger arriving early enough can stand in;
+    # Alpaca Calendar/Clock still determine the single permitted trading window.
     - cron: '17 14 * * 1-5'
     - cron: '17 15 * * 1-5'
-    # Warm starts for 13:00 ET early closes only.
+    # Nominal warm starts for 13:00 ET early closes; usable as bounded backups.
     - cron: '17 11 * * 1-5'
     - cron: '17 12 * * 1-5'
     # Normal 16:00 New York close: 15:45 EDT / EST respectively.
     - cron: '45 19 * * 1-5'
     - cron: '45 20 * * 1-5'
-    # Early 13:00 close: 12:45 EDT / EST. Calendar guard rejects other days.
+    # Nominal early close targets: 12:45 EDT / EST. Calendar sets the actual window.
     - cron: '45 16 * * 1-5'
     - cron: '45 17 * * 1-5'
   workflow_dispatch:

@@ -2,12 +2,15 @@
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal as D
+from functools import partial
+import tempfile
 from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import Mock, patch
 
 from src.bot import Config, CORE, UNIVERSE, plan_buys, plan_sells, run
 from src.safety import NY, SafetyError
+from src.state import claim_session
 from src.strategy import CoreDecision, Indicators, core_targets
 
 
@@ -248,6 +251,63 @@ class RunTests(unittest.TestCase):
         data.load.assert_not_called()
         claim.assert_not_called()
         self.assertEqual(broker.executed, [])
+
+    def test_backup_cannot_trade_after_completed_no_orders_session(self):
+        broker = FakeBroker(now=datetime(2026, 10, 26, 15, 45, tzinfo=NY))
+        with tempfile.TemporaryDirectory() as state_dir:
+            claim = Mock(wraps=partial(claim_session, environ={"EOD_STATE_DIR": state_dir}))
+            first, _, _, _ = self.run_bot(broker, claim=claim)
+            self.assertEqual(first["status"], "completed")
+            self.assertEqual(first["orders"], [])
+            self.assertTrue(first["session_claimed"])
+
+            # A queued backup can see a new entry signal within the same
+            # permitted window, but the completed session remains consumed.
+            broker.now += timedelta(minutes=1)
+            values = indicators()
+            values["AAPL"] = replace(values["AAPL"], rsi2=1)
+            backup, _, _, _ = self.run_bot(broker, FakeData(values), claim=claim)
+            self.assertEqual(backup["status"], "skipped")
+            self.assertIn("Persistent daily claim", backup["reason"])
+            self.assertEqual(claim.call_count, 2)
+            self.assertEqual(broker.executed, [])
+
+    def test_backup_after_completed_orders_skips_before_data_or_new_claim(self):
+        broker = FakeBroker()
+        with tempfile.TemporaryDirectory() as state_dir:
+            claim = Mock(wraps=partial(claim_session, environ={"EOD_STATE_DIR": state_dir}))
+            first, _, _, _ = self.run_bot(broker, claim=claim)
+            self.assertEqual(first["status"], "completed")
+            self.assertTrue(first["orders"])
+            executed = list(broker.executed)
+            # The real broker exposes submitted client IDs in its order query.
+            broker.history = [NS(client_order_id=f"eod-v1-20261016-{o['side']}-{o['symbol']}")
+                              for o in executed]
+            broker.now += timedelta(minutes=1)
+            data = FakeData()
+            data.load.side_effect = SafetyError("Backup must not reload history")
+            backup, _, _, _ = self.run_bot(broker, data, claim=claim)
+            self.assertEqual(backup["status"], "skipped")
+            self.assertIn("Bot orders already exist", backup["reason"])
+            data.load.assert_not_called()
+            self.assertEqual(claim.call_count, 1)
+            self.assertEqual(broker.executed, executed)
+
+    def test_backup_with_open_orders_still_blocks_after_consumed_session(self):
+        broker = FakeBroker(now=datetime(2026, 10, 26, 15, 45, tzinfo=NY))
+        with tempfile.TemporaryDirectory() as state_dir:
+            claim = Mock(wraps=partial(claim_session, environ={"EOD_STATE_DIR": state_dir}))
+            first, _, _, _ = self.run_bot(broker, claim=claim)
+            self.assertEqual(first["status"], "completed")
+            self.assertTrue(first["session_claimed"])
+            broker.now += timedelta(minutes=1)
+            broker.assert_no_open_orders = Mock(side_effect=SafetyError("Open orders exist"))
+            data = FakeData()
+            with self.assertRaisesRegex(SafetyError, "Open orders exist"):
+                self.run_bot(broker, data, claim=claim)
+            data.load.assert_not_called()
+            self.assertEqual(claim.call_count, 1)
+            self.assertEqual(broker.executed, [])
 
     def test_today_bought_exit_stays_in_portfolio_and_occupies_slot(self):
         broker = FakeBroker(now=datetime(2026, 10, 14, 15, 45, tzinfo=NY), holdings={

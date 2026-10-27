@@ -261,7 +261,7 @@ class SchedulingTests(unittest.TestCase):
                 preflight.assert_not_called()
                 self.assertNotIn("preflight", summary)
 
-    def test_preflight_does_not_run_on_holiday_or_alternative_cron(self):
+    def test_alternative_cron_preflight_waits_but_holiday_stays_quiet(self):
         for holiday in (False, True):
             with self.subTest(holiday=holiday):
                 broker = Broker(datetime(2026, 10, 20, 15, 42, tzinfo=NY))
@@ -271,8 +271,108 @@ class SchedulingTests(unittest.TestCase):
                     broker, event_name="schedule", scheduled_cron="45 20 * * 1-5",
                     wait_for_window=True, preflight=preflight,
                 )
+                self.assertEqual(outcome, "skipped" if holiday else "ready")
+                if holiday:
+                    preflight.assert_not_called()
+                else:
+                    preflight.assert_called_once()
+
+    def test_oct26_early_family_deliveries_can_wait_for_actual_normal_close(self):
+        # Observed deliveries at 11:24 and 12:42 CDMX were still 141/63
+        # minutes before the normal 15:45 New York target.
+        for hour, minute, cron_hour, expected_minutes in ((17, 24, 11, 141), (18, 42, 12, 63)):
+            with self.subTest(cron_hour=cron_hour):
+                broker = Broker(datetime(2026, 10, 26, hour, minute, tzinfo=timezone.utc))
+                outcome, summary = self.run_prepare(
+                    broker, event_name="schedule", scheduled_cron=f"17 {cron_hour} * * 1-5",
+                    wait_for_window=True,
+                )
+                self.assertEqual(outcome, "ready")
+                self.assertEqual(summary["observed_at"], "2026-10-26T15:45:00-04:00")
+                self.assertEqual(summary["schedule_role"], "fallback")
+                self.assertEqual(broker.timer.elapsed, expected_minutes * 60)
+
+    def test_oct26_primary_arriving_at_1556_still_reports_missed_window(self):
+        broker = Broker(datetime(2026, 10, 26, 15, 56, 54, tzinfo=NY))
+        outcome, summary = self.run_prepare(
+            broker, event_name="schedule", scheduled_cron="17 14 * * 1-5", wait_for_window=True,
+        )
+        self.assertEqual(outcome, "missed_window")
+        self.assertEqual(summary["schedule_role"], "primary")
+        self.assertEqual(broker.timer.sleeps, [])
+
+    def test_fallback_uses_calendar_across_standard_time_and_early_close(self):
+        cases = ((datetime(2026, 11, 2, 18, 42, tzinfo=timezone.utc), "16:00", 123, "15:45"),
+                 (datetime(2026, 11, 27, 14, 42, tzinfo=timezone.utc), "13:00", 183, "12:45"))
+        for start, close, minutes, target_time in cases:
+            with self.subTest(day=start.date()):
+                broker = Broker(start, close=close)
+                outcome, summary = self.run_prepare(
+                    broker, event_name="schedule", scheduled_cron="17 14 * * 1-5", wait_for_window=True,
+                )
+                self.assertEqual(outcome, "ready")
+                self.assertEqual(summary["schedule_role"], "fallback")
+                self.assertEqual(broker.timer.elapsed, minutes * 60)
+                self.assertIn(f"T{target_time}:00-05:00", summary["target_time"])
+
+    def test_all_eight_configured_crons_may_enter_actual_window(self):
+        for cron in ("17 11 * * 1-5", "17 12 * * 1-5", "17 14 * * 1-5", "17 15 * * 1-5",
+                     "45 16 * * 1-5", "45 17 * * 1-5", "45 19 * * 1-5", "45 20 * * 1-5"):
+            with self.subTest(cron=cron):
+                broker = Broker(datetime(2026, 10, 26, 15, 45, tzinfo=NY))
+                outcome, _ = self.run_prepare(broker, event_name="schedule", scheduled_cron=cron)
+                self.assertEqual(outcome, "ready")
+                self.assertEqual(broker.timer.sleeps, [])
+
+    def test_unknown_cron_and_unsupported_calendar_never_gain_fallback_access(self):
+        for cron, close in (("*/5 * * * *", "16:00"), ("", "16:00"), ("17 14 * * 1-5", "13:30")):
+            with self.subTest(cron=cron, close=close):
+                broker = Broker(datetime(2026, 10, 26, 12, 0, tzinfo=NY), close=close)
+                outcome, _ = self.run_prepare(
+                    broker, event_name="schedule", scheduled_cron=cron, wait_for_window=True,
+                )
                 self.assertEqual(outcome, "skipped")
-                preflight.assert_not_called()
+                self.assertEqual(broker.timer.sleeps, [])
+
+    def test_scheduled_wait_exactly_330_minutes_allowed_beyond_it_skips(self):
+        target = datetime(2026, 10, 26, 15, 45, tzinfo=NY)
+        for excess, expected in ((timedelta(0), "ready"), (timedelta(microseconds=1), "skipped")):
+            with self.subTest(excess=excess):
+                broker = Broker(target - timedelta(seconds=MAX_WAIT_SECONDS) - excess)
+                outcome, _ = self.run_prepare(
+                    broker, event_name="schedule", scheduled_cron="17 11 * * 1-5", wait_for_window=True,
+                )
+                self.assertEqual(outcome, expected)
+                self.assertEqual(broker.timer.elapsed, MAX_WAIT_SECONDS if expected == "ready" else 0)
+
+    def test_fallback_start_cutoff_remains_exclusive_and_late_arrival_quiet(self):
+        target = datetime(2026, 10, 26, 15, 45, tzinfo=NY)
+        for delta, expected in ((timedelta(minutes=5, microseconds=-1), "ready"),
+                                (timedelta(minutes=5), "skipped"), (timedelta(hours=2), "skipped")):
+            with self.subTest(delta=delta):
+                broker = Broker(target + delta)
+                outcome, _ = self.run_prepare(
+                    broker, event_name="schedule", scheduled_cron="17 11 * * 1-5", wait_for_window=True,
+                )
+                self.assertEqual(outcome, expected)
+                self.assertEqual(broker.timer.sleeps, [])
+
+    def test_admitted_fallback_clock_jump_or_slow_preflight_reports_real_miss(self):
+        for slow_preflight in (False, True):
+            with self.subTest(slow_preflight=slow_preflight):
+                broker = Broker(datetime(2026, 10, 26, 15, 44, tzinfo=NY))
+                callback = None
+                if slow_preflight:
+                    def callback(window):
+                        broker.timer.elapsed += 7 * 60
+                else:
+                    broker.clock_transform = lambda value: value + timedelta(minutes=10) if broker.timer.elapsed else value
+                outcome, summary = self.run_prepare(
+                    broker, event_name="schedule", scheduled_cron="17 11 * * 1-5",
+                    wait_for_window=True, preflight=callback,
+                )
+                self.assertEqual(outcome, "missed_window")
+                self.assertEqual(summary["schedule_role"], "fallback")
 
     def test_preflight_does_not_run_when_clock_reports_market_closed(self):
         broker = Broker(datetime(2026, 10, 20, 15, 42, tzinfo=NY), is_open=False)

@@ -19,9 +19,14 @@ MAX_WAIT_SECONDS = 330 * 60
 POLL_SECONDS = 60
 LOG = logging.getLogger("trading_eod.scheduling")
 
-# Keep rows distinct in the workflow so github.event.schedule identifies the
-# intended UTC family even when a delayed job starts after the market closes.
+# Keep rows distinct so late arrivals can still be attributed to today's
+# intended family. Earlier arrivals from any configured family are usable
+# when the broker calendar and bounded waiting policy permit them.
 WARM_HOUR_BY_TARGET_HOUR = {19: 14, 20: 15, 16: 11, 17: 12}
+KNOWN_CRONS = frozenset(
+    cron for target_hour, warm_hour in WARM_HOUR_BY_TARGET_HOUR.items()
+    for cron in (f"45 {target_hour} * * 1-5", f"17 {warm_hour} * * 1-5")
+)
 
 
 def _calendar_window(broker, clock):
@@ -79,10 +84,11 @@ def prepare_start(
 ) -> str:
     """Return ready/skipped/missed_window using only broker Clock and Calendar.
 
-    Scheduled runs must match today's calendar-derived UTC family. A matching
-    scheduled run arriving after the start deadline is a *candidate* missed
-    window: the caller must reconcile persistent execution state before sending
-    an alert. Manual late runs and alternative DST/early-close crons stay quiet.
+    Any explicitly configured cron can wait for today's supported calendar
+    target or enter its valid start window. A late arrival from today's primary
+    family, or an admitted wait that overruns, is a *candidate* missed window:
+    the caller must reconcile persistent execution state before sending an
+    alert. Manual late runs and late alternative-family arrivals stay quiet.
 
     Waiting is optional, uses sleeps of at most 60 seconds and is bounded by
     330 monotonic minutes. The calendar, session date, target and broker clock
@@ -102,15 +108,24 @@ def prepare_start(
         return _outcome(summary, "skipped", "No market session on the observed New York date")
 
     scheduled = event_name == "schedule"
-    if scheduled and scheduled_cron not in _expected_crons(window):
-        return _outcome(summary, "skipped", "Alternative or unrecognized scheduled UTC family")
+    expected_crons = _expected_crons(window)
+    if scheduled:
+        if not expected_crons:
+            return _outcome(summary, "skipped", "Unsupported calendar target for configured schedule")
+        if scheduled_cron not in KNOWN_CRONS:
+            return _outcome(summary, "skipped", "Unrecognized scheduled UTC family")
+        summary["schedule_role"] = "primary" if scheduled_cron in expected_crons else "fallback"
 
     original_day, original_target = window.day, window.target
+    wait_admitted = False
     if now < window.target:
         if not wait_for_window:
             return _outcome(summary, "skipped", "Before calendar start window; waiting disabled")
         if (window.target - now).total_seconds() > MAX_WAIT_SECONDS:
+            if scheduled:
+                return _outcome(summary, "skipped", "Calendar target beyond maximum prestart wait of 330 minutes")
             raise SafetyError("Calendar target exceeds maximum prestart wait of 330 minutes")
+        wait_admitted = True
         wait_started = monotonic()
         if not math.isfinite(wait_started):
             raise SafetyError("Invalid monotonic clock during prestart wait")
@@ -177,6 +192,8 @@ def prepare_start(
         if not clock.is_open:
             raise SafetyError("Market is closed inside the calendar start window")
         return _outcome(summary, "ready", "Inside calendar start window")
-    if scheduled:
+    if scheduled and (scheduled_cron in expected_crons or wait_admitted):
         return _outcome(summary, "missed_window", "Scheduled run arrived after calendar start deadline")
+    if scheduled:
+        return _outcome(summary, "skipped", "Alternative scheduled family arrived after calendar start deadline")
     return _outcome(summary, "skipped", "Manual run outside calendar start window")
