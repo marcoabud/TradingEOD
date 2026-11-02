@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 import requests
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
@@ -67,7 +68,27 @@ def export_dataset(start, end, output, *, client, calendar_rows, retrieved_at=No
     for symbol in SYMBOLS:
         if symbol not in frame.index.get_level_values("symbol"):
             raise SafetyError(f"Research symbol missing: {symbol}")
-        clean = validate_bars(frame.xs(symbol, level="symbol"), dates, symbol)
+        raw = frame.xs(symbol, level="symbol")
+        try:
+            clean = validate_bars(raw, dates, symbol)
+        except SafetyError as exc:
+            # Fixed market fields only. Surface the precise data defect without
+            # provider bodies, URLs or credentials; never silently repair bars.
+            columns = ["open", "high", "low", "close", "volume"]
+            if set(columns).issubset(raw.columns):
+                values = raw[columns].astype(float)
+                bad = (~np.isfinite(values) | (values <= 0)).any(axis=1)
+                invalid = values.loc[bad]
+                if len(invalid):
+                    sample = []
+                    for timestamp, row in invalid.head(5).iterrows():
+                        sample.append({"date": timestamp.tz_convert(NY).date().isoformat(),
+                                       **{k: float(v) if np.isfinite(v) else None for k, v in row.items()}})
+                    detail = {"symbol": symbol, "invalid_bars": len(invalid),
+                              "last_invalid": invalid.index[-1].tz_convert(NY).date().isoformat(),
+                              "samples": sample}
+                    raise SafetyError("Historical data rejected: " + json.dumps(detail, allow_nan=False)) from None
+            raise exc
         clean = clean[["open", "high", "low", "close", "volume"]].copy()
         clean.index.name = "date"
         clean = clean.reset_index()

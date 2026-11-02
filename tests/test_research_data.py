@@ -54,6 +54,13 @@ class ResearchExportTests(unittest.TestCase):
             self.export()
         self.client.get_stock_bars.assert_not_called()
 
+    def test_invalid_bar_reports_exact_safe_date_and_field_without_repair(self):
+        self.frame.loc[("SGOV", pd.Timestamp(self.days[0], tz="America/New_York")), "volume"] = 0
+        with self.assertRaisesRegex(SafetyError, '"last_invalid": "2026-10-28"') as raised:
+            self.export()
+        self.assertIn('"volume": 0.0', str(raised.exception))
+        self.assertFalse(self.output.exists())
+
     def test_read_only_transport_rejects_mutations_and_account_endpoints(self):
         with ReadOnlySession() as session, patch("requests.Session.request") as request:
             for method, url in (("POST", "https://data.alpaca.markets/v2/stocks/bars"),
