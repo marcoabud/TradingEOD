@@ -33,7 +33,9 @@ jobs:
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-        run: python -m src.research_data --start 2020-06-01 --end 2026-10-30 --output research_data
+        # SGOV has five zero-volume bars through 2020-08-03. Begin after that
+        # observed data-quality boundary; never synthesize or loosen validation.
+        run: python -m src.research_data --start 2020-08-04 --end 2026-10-30 --output research_data
       - name: Compare fixed variants without broker credentials
         run: python -m src.research --input research_data --output research_results --initial-equity 4000 --cost-bps 1 5 10
       - name: Preserve research evidence

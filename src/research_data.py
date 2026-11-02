@@ -122,7 +122,7 @@ def export_dataset(start, end, output, *, client, calendar_rows, retrieved_at=No
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--start", type=date.fromisoformat, default=date(2020, 6, 1))
+    parser.add_argument("--start", type=date.fromisoformat, default=date(2020, 8, 4))
     parser.add_argument("--end", type=date.fromisoformat, default=date(2026, 10, 30))
     parser.add_argument("--output", type=Path, default=Path("research_data"))
     args = parser.parse_args(argv)

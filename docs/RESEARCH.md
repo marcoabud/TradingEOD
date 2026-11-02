@@ -15,6 +15,8 @@ Los umbrales 5% y 10% son escenarios fijos para sensibilidad, no resultados de o
 
 ## Archivos de entrada
 
+La descarga inicial usa 2020-08-04 a 2026-10-30, antes del calentamiento de 250 sesiones. El intento desde junio de 2020 fue rechazado: SGOV devolvió volumen cero el 3, 8, 9 y 16 de junio y el 3 de agosto. Se excluye ese prefijo por calidad de datos, sin reparar barras ni escoger fechas por rentabilidad. El registro de diagnóstico está en [la ejecución 41365540744](https://github.com/marcoabud/TradingEOD/actions/runs/41365540744). La validación de trading no se modifica.
+
 Directorio con `manifest.json`, `daily.csv` y `calendar.csv`. Se exige el universo completo: SPY, QQQ, SMH, GLD, SGOV, AAPL, MSFT, NVDA, AMZN, META, GOOGL, AVGO, LLY, COST, JPM, BRK.B y V.
 
 `daily.csv`:
