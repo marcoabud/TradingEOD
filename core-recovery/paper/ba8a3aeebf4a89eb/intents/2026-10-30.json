@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "account_hash": "ba8a3aeebf4a89eb",
+  "mode": "paper",
+  "session_date": "2026-10-30",
+  "started_at": "2026-10-30T15:45:00.013342-04:00",
+  "signal_as_of": "2026-10-29",
+  "regime": "RISK-OFF",
+  "targets": {
+    "SGOV": "0.7"
+  },
+  "initial_core_qty": {
+    "SPY": "1.841321657",
+    "QQQ": "1.986672078",
+    "SMH": "0",
+    "GLD": "0",
+    "SGOV": "0"
+  },
+  "equity": "3956.85",
+  "source_revision": "beed428c8be236e656a13e04ca672c9f6c9929ff",
+  "origin": "verified_import",
+  "source_evidence": {
+    "artifact_id": 13006682237,
+    "digest": "282c580364ffb2837de8c1210afe5d283bc625113b3e8f6e5c332b8bf92cca14"
+  },
+  "supersedes": null
+}
