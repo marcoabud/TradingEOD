@@ -35,6 +35,18 @@ class NotifierTests(unittest.TestCase):
         self.assertEqual(self.send({}), {})
         self.session.post.assert_not_called()
 
+    def test_pending_core_and_initial_equity_are_distinguished_from_data_failure(self):
+        self.summary.update(status="degraded", equity_snapshot="evaluation_start",
+                            evaluation_outcome="core_recovery_pending", core_status="held_signal_changed",
+                            core_recovery={"status":"held_signal_changed", "intent_date":"2026-10-30",
+                                           "pending":True, "private":"must-not-leak"})
+        self.send({"TELEGRAM_BOT_TOKEN":"123:abc", "TELEGRAM_CHAT_ID":"456"})
+        text = self.session.post.call_args.kwargs["json"]["text"]
+        self.assertIn("Core pendiente de completar", text)
+        self.assertIn("no saldo final", text)
+        self.assertIn("2026-10-30", text)
+        self.assertNotIn("must-not-leak", text)
+
     def test_webhook_json_contains_summary_and_bounded_timeout(self):
         result = self.send({"WEBHOOK_URL": "https://example.com/hook"})
         self.assertEqual(result, {"webhook": True})

@@ -12,7 +12,7 @@ from src.bot import Config, UNIVERSE, plan_buys, position_value, run
 from src.safety import NY, SafetyError
 from src.state import claim_missed_window, claim_session, record_evaluation_attempt
 from src.strategy import CoreDecision, SWING_UNIVERSE, StrategyDataError
-from tests.test_bot import FakeBroker, FakeData, indicators, position
+from tests.test_bot import empty_core_store, FakeBroker, FakeData, indicators, position
 
 
 WEDNESDAY = date(2026, 10, 21)
@@ -80,7 +80,7 @@ class QuoteScopeTests(unittest.TestCase):
         claim = Mock(return_value=True) if claim is None else claim
         summary = {}
         run(Config("synthetic-key", "synthetic-secret", True, dry_run, "iex"),
-            broker, data, summary, claim=claim, observe=observe)
+            broker, data, summary, claim=claim, observe=observe, core_store=empty_core_store())
         return summary, observe, claim
 
     def test_wednesday_without_sgov_holding_never_quotes_it_even_during_refresh(self):
@@ -199,7 +199,7 @@ class QuoteScopeTests(unittest.TestCase):
         self.assertIsNone(summary["indicators"]["AAPL"]["price"])
         self.assertEqual([(order["side"], order["symbol"]) for order in broker.executed], [("sell", "AAPL")])
 
-    def test_summary_uses_latest_prices_from_each_pre_buy_refresh(self):
+    def test_summary_uses_latest_post_fill_completion_prices(self):
         class ChangingData(ScopedData):
             def prices(self, symbols, now):
                 current = super().prices(symbols, now)
@@ -209,10 +209,10 @@ class QuoteScopeTests(unittest.TestCase):
         summary, _, _ = self.run_bot(broker, data)
         self.assertEqual(summary["status"], "completed")
         self.assertEqual(len(broker.executed), 2)
-        self.assertEqual(data.price_calls, 4)
+        self.assertEqual(data.price_calls, 5)
         self.assertEqual(summary["quoted_symbols"], ["SPY", "QQQ"])
         for symbol in ("SPY", "QQQ"):
-            self.assertEqual(summary["indicators"][symbol]["price"], data.values[symbol].price + 4)
+            self.assertEqual(summary["indicators"][symbol]["price"], data.values[symbol].price + 5)
         self.assertIsNone(summary["indicators"]["SGOV"]["price"])
 
     def test_invalid_quote_for_newly_reconciled_holding_blocks_subsequent_actions(self):
@@ -260,7 +260,7 @@ class EvaluationAttemptIntegrationTests(unittest.TestCase):
             summary = {}
             with self.assertRaisesRegex(SafetyError, "Quote service unavailable: permission"):
                 run(Config("synthetic-key", "synthetic-secret", True, False, "iex"),
-                    broker, data, summary, claim=claim, observe=observe)
+                    broker, data, summary, claim=claim, observe=observe, core_store=empty_core_store())
             self.assertTrue(summary["evaluation_recorded"])
             self.assertEqual(len(list((Path(directory) / "evaluations").rglob("*.json"))), 1)
             self.assertFalse((Path(directory) / "sessions").exists())
@@ -288,7 +288,7 @@ class EvaluationAttemptIntegrationTests(unittest.TestCase):
             values["AAPL"] = replace(values["AAPL"], rsi2=1)
             broker, data, summary = FakeBroker(now=at_start(WEDNESDAY)), ScopedData(values), {}
             run(Config("synthetic-key", "synthetic-secret", True, False, "iex"),
-                broker, data, summary, claim=claim, observe=observe)
+                broker, data, summary, claim=claim, observe=observe, core_store=empty_core_store())
             self.assertEqual(observed_results, [False])
             self.assertEqual(summary["status"], "completed")
             self.assertTrue(summary["evaluation_recorded"])
@@ -310,7 +310,7 @@ class EvaluationAttemptIntegrationTests(unittest.TestCase):
             data, claim, summary = ScopedData(), Mock(), {}
             with self.assertRaisesRegex(SafetyError, "Account inactive or blocked"):
                 run(Config("synthetic-key", "synthetic-secret", True, False, "iex"),
-                    broker, data, summary, claim=claim, observe=observe)
+                    broker, data, summary, claim=claim, observe=observe, core_store=empty_core_store())
             self.assertTrue(summary["evaluation_recorded"])
             self.assertFalse(claim_missed_window("fake-account", WEDNESDAY, True, environ=env))
             data.load.assert_not_called()
@@ -322,7 +322,7 @@ class EvaluationAttemptIntegrationTests(unittest.TestCase):
         claim = Mock(side_effect=AssertionError("Dry runs must not claim trading"))
         broker, data, summary = FakeBroker(now=at_start(WEDNESDAY)), ScopedData(), {}
         run(Config("synthetic-key", "synthetic-secret", True, True, "iex"),
-            broker, data, summary, claim=claim, observe=observe)
+            broker, data, summary, claim=claim, observe=observe, core_store=empty_core_store())
         self.assertEqual(summary["status"], "dry_run")
         self.assertNotIn("evaluation_recorded", summary)
         observe.assert_not_called()

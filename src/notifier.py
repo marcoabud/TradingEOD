@@ -20,6 +20,7 @@ RETRY_STATUSES = frozenset({429, 502, 503, 504})
 SUMMARY_FIELDS = (
     "status", "session_date", "mode", "regime", "equity", "pnl_day", "reason",
     "reserved_cash", "reserved_slots", "core_status", "buy_blocked", "evaluation_outcome",
+    "equity_snapshot",
 )
 ORDER_FIELDS = (
     "symbol", "side", "status", "notional", "qty", "filled_qty",
@@ -75,6 +76,10 @@ def _payload(summary: Mapping[str, Any], environ: Mapping[str, str]) -> dict[str
         for issue in issues[:MAX_ITEMS] if isinstance(issue, Mapping)
     ]
     payload["source"] = "TradingEOD"
+    recovery = summary.get("core_recovery")
+    if isinstance(recovery, Mapping):
+        payload["core_recovery"] = {key: _scalar(recovery[key], secrets)
+                                    for key in ("status", "intent_date", "pending") if key in recovery}
     return payload
 
 
@@ -85,6 +90,8 @@ def _telegram_text(payload: Mapping[str, Any]) -> str:
         "blocked": "Bloqueado", "error": "Error", "dry_run": "Simulación",
         "missed_window": "Ventana EOD perdida", "skipped": "Omitido",
     }.get(status, str(status))
+    if status == "degraded" and payload.get("evaluation_outcome") == "core_recovery_pending":
+        status_label = "Core pendiente de completar"
     lines = [
         "TradingEOD | " + status_label,
         "Fecha: " + str(payload.get("session_date", "n/a")),
@@ -95,6 +102,8 @@ def _telegram_text(payload: Mapping[str, Any]) -> str:
     ]
     if payload.get("reason"):
         lines.append("Detalle: " + str(payload["reason"]))
+    if payload.get("equity_snapshot") == "evaluation_start":
+        lines.append("Equity/P&L: lectura al inicio de la evaluación, no saldo final")
     if payload.get("evaluation_outcome"):
         outcome = payload["evaluation_outcome"]
         outcome_label = {
@@ -103,6 +112,7 @@ def _telegram_text(payload: Mapping[str, Any]) -> str:
             "orders_confirmed": "Órdenes confirmadas", "data_omissions": "Operaciones omitidas por datos",
             "planned": "Plan simulado", "degraded": "Plan simulado con datos insuficientes",
             "evaluating": "Evaluación interrumpida",
+            "core_recovery_pending": "Asignación core pendiente de conciliación o señal",
         }.get(outcome, str(outcome))
         lines.append("Evaluación: " + outcome_label)
     if payload.get("core_status"):
@@ -110,9 +120,14 @@ def _telegram_text(payload: Mapping[str, Any]) -> str:
         core_label = {
             "not_due": "Sin rebalanceo semanal hoy", "ready": "Pendiente",
             "frozen": "Suspendido por datos", "incomplete": "Rebalanceo incompleto",
-            "completed": "Evaluación semanal completada",
+            "completed": "Asignación core verificada",
+            "held_signal_changed": "En espera: la señal cambió desde el intento anterior",
         }.get(core, str(core))
         lines.append("Estado Core: " + core_label)
+    if payload.get("core_recovery"):
+        recovery = payload["core_recovery"]
+        lines.append("Recuperación core: " + str(recovery.get("status", "n/a")) +
+                     " | origen " + str(recovery.get("intent_date", "n/a")))
     if "reserved_cash" in payload:
         lines.append("Efectivo reservado USD: " + str(payload["reserved_cash"]))
     if "reserved_slots" in payload:

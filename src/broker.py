@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import time
-from datetime import timedelta
+import math
+import re
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import requests
@@ -10,7 +12,12 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import GetCalendarRequest, GetOrdersRequest, MarketOrderRequest
 
-from .safety import NY, SafetyError, aware, decimal, midnight, quantity
+from .safety import NY, SafetyError, aware, decimal, midnight, quantity, validate_account
+
+
+OPEN_ORDER_RECHECK_SECONDS = 6.0
+OPEN_ORDER_RECHECK_POLLS = 3
+RECENT_FILL_SECONDS = 30.0
 
 
 class TimeoutSession(requests.Session):
@@ -35,6 +42,17 @@ def value(item):
 class Broker:
     def __init__(self, key, secret, paper=True):
         self.client = bound_client(TradingClient(key, secret, paper=paper))
+
+    def bind_context(self, window, summary):
+        """Attach diagnostics to this run, without granting order authorization.
+
+        Receipts come only from this instance's successful execute() calls.
+        A summary or previous-session record can never seed them.
+        """
+        previous = getattr(self, "_execution_context", None)
+        if previous is None or previous[0].day != window.day or previous[1] is not summary:
+            self._recent_fills = {}
+        self._execution_context = (window, summary)
 
     def clock(self):
         return self.client.get_clock()
@@ -70,9 +88,154 @@ class Broker:
             raise SafetyError("Order query saturated; cannot certify complete history")
         return result
 
-    def assert_no_open_orders(self):
-        if self.orders(open_only=True):
-            raise SafetyError("Open orders exist; dedicated account must be quiescent")
+    @staticmethod
+    def _order_diagnostic(order):
+        """Allowlisted metadata only; never stringify an API exception or body."""
+        def token(name):
+            raw = getattr(order, name, None)
+            if raw is None:
+                return None
+            raw = str(getattr(raw, "value", raw))
+            return raw if re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", raw) else "invalid"
+
+        row = {name: token(name) for name in ("id", "symbol", "side", "status", "client_order_id")}
+        for name in ("created_at", "submitted_at", "updated_at", "filled_at"):
+            raw = getattr(order, name, None)
+            try:
+                row[name] = aware(raw).isoformat() if raw is not None else None
+            except (TypeError, ValueError, OverflowError, SafetyError):
+                row[name] = "invalid"
+        return row
+
+    @staticmethod
+    def _same_filled_order(order, receipt):
+        """A re-read must identify exactly the verified full fill, not just a symbol."""
+        try:
+            return (
+                str(getattr(order, "id", "")) == receipt["id"]
+                and getattr(order, "symbol", None) == receipt["symbol"]
+                and getattr(order, "client_order_id", None) == receipt["client_order_id"]
+                and value(getattr(order, "side", None)) == receipt["side"]
+                and value(getattr(order, "status", None)) == "filled"
+                and decimal(getattr(order, "filled_qty", None)) == receipt["filled_qty"]
+                and decimal(getattr(order, "filled_avg_price", None)) == receipt["filled_avg_price"]
+                and not getattr(order, "legs", None)
+            )
+        except (ArithmeticError, ValueError, TypeError, SafetyError):
+            return False
+
+    def assert_no_open_orders(self, *, sleeper=time.sleep, monotonic=time.monotonic):
+        """Require an empty open-order query; only recent own fills may be rechecked.
+
+        This is a bounded read-only reconciliation, never an exception to the
+        empty-list requirement. Unknown orders, partials, conflicting state,
+        expired receipts and any uncertainty keep the account blocked.
+        """
+        rows = self.orders(open_only=True)
+        if not rows:
+            return
+        context = getattr(self, "_execution_context", None)
+        window, summary = context if context is not None else (None, None)
+        check = {"status": "blocked", "snapshots": [], "polls": 0}
+        if summary is not None:
+            summary.setdefault("open_order_checks", []).append(check)
+
+        def snapshot(items, observed_at=None):
+            check["snapshots"].append({
+                "observed_at": observed_at or datetime.now(timezone.utc).isoformat(),
+                "orders": [self._order_diagnostic(item) for item in items],
+            })
+
+        snapshot(rows)
+        blocked = "Open orders exist; dedicated account must be quiescent"
+        receipts = getattr(self, "_recent_fills", {})
+        if window is None or not receipts:
+            check["reason"] = "NO_RECENT_OWN_FILL"
+            raise SafetyError(blocked)
+        started = monotonic()
+        if not math.isfinite(started):
+            check["reason"] = "INVALID_RECONCILIATION_CLOCK"
+            raise SafetyError(blocked)
+
+        def remaining():
+            elapsed = monotonic() - started
+            if not math.isfinite(elapsed) or elapsed < 0 or elapsed >= OPEN_ORDER_RECHECK_SECONDS:
+                raise SafetyError("Open-order reconciliation deadline reached")
+            return OPEN_ORDER_RECHECK_SECONDS - elapsed
+
+        involved = {}
+        try:
+            for attempt in range(OPEN_ORDER_RECHECK_POLLS):
+                remaining()
+                checked_at = aware(self.assert_time(window)).isoformat()
+                check["snapshots"][-1]["observed_at"] = checked_at
+                ids = set()
+                for item in rows:
+                    order_id = str(getattr(item, "id", ""))
+                    receipt = receipts.get(order_id)
+                    age = monotonic() - receipt["confirmed_monotonic"] if receipt else -1
+                    if (receipt is None or order_id in ids or not math.isfinite(age)
+                            or not 0 <= age <= RECENT_FILL_SECONDS
+                            or getattr(item, "symbol", None) != receipt["symbol"]
+                            or getattr(item, "client_order_id", None) != receipt["client_order_id"]
+                            or value(getattr(item, "side", None)) != receipt["side"]
+                            or value(getattr(item, "status", None)) not in {
+                                "new", "accepted", "pending_new", "accepted_for_bidding", "filled",
+                            } or getattr(item, "legs", None)):
+                        check["reason"] = "UNKNOWN_OR_UNSAFE_OPEN_ORDER"
+                        raise SafetyError(blocked)
+                    # A pending row may be an old zero-fill snapshot, but a
+                    # partial/contradictory fill never earns a waiting exception.
+                    try:
+                        listed_qty = decimal(getattr(item, "filled_qty", None))
+                    except (ArithmeticError, ValueError, TypeError, SafetyError):
+                        listed_qty = Decimal(-1)
+                    if (value(item.status) == "filled" and not self._same_filled_order(item, receipt)
+                            or value(item.status) != "filled" and listed_qty != 0):
+                        check["reason"] = "CONTRADICTORY_OPEN_LIST_FILL"
+                        raise SafetyError(blocked)
+                    ids.add(order_id)
+                    remaining()
+                    verified = self.client.get_order_by_id(order_id)
+                    remaining()
+                    if not self._same_filled_order(verified, receipt):
+                        check["reason"] = "OWN_FILL_RECHECK_MISMATCH"
+                        raise SafetyError(blocked)
+                    involved[order_id] = receipt
+                # Polling may only confirm absence, never filter away an order.
+                sleeper(min(1.0, remaining()))
+                remaining()
+                self.assert_time(window)
+                rows = self.orders(open_only=True)
+                check["polls"] = attempt + 1
+                remaining()
+                snapshot(rows, aware(self.assert_time(window)).isoformat())
+                if rows:
+                    continue
+                current = self.positions()
+                remaining()
+                for receipt in involved.values():
+                    actual = decimal(current[receipt["symbol"]].qty) if receipt["symbol"] in current else Decimal(0)
+                    if actual != receipt["expected_position_qty"]:
+                        check["reason"] = "POSITION_NOT_RECONCILED"
+                        raise SafetyError("Position has not reconciled after confirmed fill")
+                account = self.account()
+                remaining()
+                validate_account(account)
+                # Persist numeric account evidence, but never an account ID/key.
+                cash = decimal(account.cash)
+                if cash < 0:
+                    raise SafetyError("Cash has not reconciled after confirmed fill")
+                self.assert_time(window)
+                remaining()
+                check.update(status="resolved", reason="OWN_FILLS_RECONCILED_OPEN_LIST_EMPTY",
+                             cash=str(cash), equity=str(decimal(account.equity)))
+                return
+            check["reason"] = "OPEN_LIST_STILL_NONEMPTY"
+            raise SafetyError(blocked)
+        except Exception:
+            check.setdefault("reason", "RECONCILIATION_FAILED_CLOSED")
+            raise
 
     def fills_today(self, day):
         """FILL covers executions of orders submitted before today, including partials."""
@@ -131,6 +294,7 @@ class Broker:
         from uuid import UUID
         from alpaca.trading.enums import OrderStatus
 
+        self.bind_context(window, summary)
         self.assert_time(window)
         self.assert_no_open_orders()
         if side == "sell":
@@ -140,6 +304,9 @@ class Broker:
                 raise SafetyError("Sell exceeds verified long position")
         elif symbol in self.traded_symbols(window.day, "sell"):
             raise SafetyError(f"Same-session reentry blocked: {symbol}")
+        else:
+            position = self.positions().get(symbol)
+        before_qty = decimal(position.qty) if position is not None else Decimal(0)
         submission_time = self.assert_time(window)
         if pre_submit is not None:
             # The callback must be local validation only. Recheck quotes using
@@ -219,6 +386,17 @@ class Broker:
             deadline = time.monotonic() + 90
             while True:
                 if verified_status == "filled":
+                    confirmed_at = time.monotonic()
+                    if not math.isfinite(confirmed_at):
+                        raise SafetyError("Invalid monotonic clock after fill confirmation")
+                    filled_qty = decimal(order.filled_qty)
+                    self._recent_fills[verified_id] = {
+                        "id": verified_id, "symbol": symbol, "side": side,
+                        "client_order_id": client_id, "filled_qty": filled_qty,
+                        "filled_avg_price": decimal(order.filled_avg_price),
+                        "expected_position_qty": before_qty + (filled_qty if side == "buy" else -filled_qty),
+                        "confirmed_monotonic": confirmed_at,
+                    }
                     return order
                 if verified_status in terminal:
                     raise SafetyError(f"Order did not fully fill: {symbol} ({verified_status})")

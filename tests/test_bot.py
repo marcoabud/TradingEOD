@@ -22,6 +22,15 @@ def position(symbol, qty, entry=100):
     return NS(symbol=symbol, qty=D(str(qty)), avg_entry_price=D(str(entry)))
 
 
+def empty_core_store():
+    """Legacy allocation tests isolate persistence; recovery has integration tests."""
+    store = Mock()
+    store.pending.return_value = None
+    store.begin.side_effect = lambda day, *args, **kwargs: {"session_date": day.isoformat()}
+    store.finish.return_value = True
+    return store
+
+
 class FakeBroker:
     def __init__(self, now=None, holdings=None, cash=4000):
         self.now = now or datetime(2026, 10, 16, 15, 45, tzinfo=NY)
@@ -43,6 +52,9 @@ class FakeBroker:
     def clock(self):
         self.trace.append("clock")
         return NS(timestamp=self.now, is_open=self.is_open)
+
+    def bind_context(self, window, summary):
+        self.bound_context = (window, summary)
 
     def calendar(self, start, end):
         self.trace.append("calendar")
@@ -188,7 +200,7 @@ class RunTests(unittest.TestCase):
         claim = claim or Mock(return_value=True)
         summary = {}
         run(Config("fake-key", "fake-secret", True, dry), broker, data, summary,
-            claim=claim, observe=Mock(return_value=True))
+            claim=claim, observe=Mock(return_value=True), core_store=empty_core_store())
         return summary, broker, data, claim
 
     def test_closed_market_skips_before_account_or_data(self):

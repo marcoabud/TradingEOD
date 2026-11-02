@@ -63,7 +63,7 @@ class QuoteSession:
                             indicators={s: asdict(i) for s, i in self.indicators.items()})
         return set(batch.failures)
 
-    def guard(self, symbols, now):
+    def guard(self, symbols, now, *, phase="pre_submit"):
         failed = set()
         diagnostics = {}
         for symbol in symbols:
@@ -72,9 +72,10 @@ class QuoteSession:
             try:
                 quote_price(self.quotes.get(symbol), now, symbol)
             except SafetyError:
-                self.issue(symbol, "pre_submit", "quote_expired_before_submission")
+                self.issue(symbol, phase, "quote_expired_before_submission" if phase == "pre_submit"
+                           else "quote_expired_before_completion")
                 failed.add(symbol)
-        self.summary["quote_checks"].append(dict(phase="pre_submit", checked_at=now.isoformat(),
+        self.summary["quote_checks"].append(dict(phase=phase, checked_at=now.isoformat(),
                                                 diagnostics=diagnostics))
         if failed:
             raise QuoteOmission(failed)
@@ -103,7 +104,8 @@ def select_slots(quotes, ranked, occupied):
     return selected, reserved
 
 
-def execute_strategy(config, broker, data, summary, window, account, positions, indicators, decision, claim):
+def execute_strategy(config, broker, data, summary, window, account, positions, indicators, decision, claim,
+                     *, before_orders=None, after_core=None):
     # Local import keeps the existing pure allocation helpers available to callers.
     from .bot import CORE, ZERO, assert_portfolio, plan_buys, plan_sells, reserved_cash_amount
 
@@ -187,6 +189,8 @@ def execute_strategy(config, broker, data, summary, window, account, positions, 
         summary.update(status="skipped", reason="Persistent daily claim already exists; no same-day retry")
         return
     summary["session_claimed"] = True
+    if before_orders is not None:
+        before_orders()
     sold = {}
     for symbol, sale in sells.items():
         if symbol in CORE and not core_active:
@@ -306,16 +310,42 @@ def execute_strategy(config, broker, data, summary, window, account, positions, 
         if buy["block"] == "core":
             mark_core_started()
         excluded.add(symbol)
+    broker.assert_no_open_orders()
     account = broker.account()
     current = broker.positions()
+    validate_account(account)
     assert_portfolio(current)
+    if after_core is not None and core_active:
+        # A confirmed fill may arrive much later than its pre-submit quote.
+        # Completion is durable: certify the allocation only with new prices,
+        # a refreshed account/position snapshot and an in-window freshness check.
+        failed = q.fetch(core_symbols(current), "core_completion")
+        if failed:
+            freeze_core()
+        account = broker.account()
+        current = broker.positions()
+        validate_account(account)
+        assert_portfolio(current)
+        completion_time = broker.clock().timestamp
+        if not window.accepts_order(completion_time):
+            raise SafetyError("Core completion could not be verified within the permitted window")
+        if core_active:
+            try:
+                q.guard(core_symbols(current), completion_time, phase="core_completion_guard")
+            except QuoteOmission:
+                freeze_core()
     record_reserve(current, account, reserved)
+    core_finished = after_core(current, q.indicators, account, core_active) if after_core is not None else True
     if core_active:
-        summary["core_status"] = "completed"
-    degraded = bool(summary["data_issues"])
+        summary["core_status"] = "completed" if core_finished else "incomplete"
+    degraded = bool(summary["data_issues"]) or not core_finished
     outcome = "data_omissions" if degraded else "orders_confirmed" if summary["orders"] else "no_orders_required"
+    if not core_finished:
+        outcome = "core_recovery_pending"
     summary.update(status="degraded" if degraded else "completed", evaluation_outcome=outcome,
                    equity=str(account.equity), pnl_day=str(decimal(account.equity)-decimal(account.last_equity)),
                    cash_remaining=str(account.cash),
-                   reason="Session complete with data omissions; inspect affected assets" if degraded else
+                   equity_snapshot="evaluation_end",
+                   reason="Core allocation remains pending; inspect recovery state" if not core_finished else
+                          "Session complete with data omissions; inspect affected assets" if degraded else
                           "Orders confirmed" if summary["orders"] else "No orders required by evaluated signals and holdings")

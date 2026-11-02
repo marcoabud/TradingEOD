@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 
 from .broker import Broker
+from .core_recovery import (CoreRecoveryStore, MAX_RECOVERY_DAYS, reconcile_intent,
+                            select_recovery_decision)
 from .data import MarketData
 from .notifier import notify
 from .safety import (NY, SafetyError, aware, decimal, money, quantity,
@@ -171,7 +173,7 @@ def snapshot_indicators(summary, indicators):
                    indicators={s: asdict(ind) for s, ind in indicators.items()})
 
 
-def run(config, broker, data, summary, claim=claim_session, observe=None):
+def run(config, broker, data, summary, claim=claim_session, observe=None, core_store=None):
     # Calendar and Clock are always the first account-side operations.
     clock = broker.clock()
     day = aware(clock.timestamp).astimezone(NY).date()
@@ -199,23 +201,85 @@ def run(config, broker, data, summary, claim=claim_session, observe=None):
     equity = decimal(account.equity)
     summary.update(equity=str(equity), pnl_day=str(equity-decimal(account.last_equity)),
                    pnl_day_note="Equity minus last_equity; deposits/withdrawals are not adjusted",
+                   equity_snapshot="evaluation_start",
                    weekly_rebalance=window.weekly_rebalance,
                    target_time=window.target.isoformat())
+    broker.bind_context(window, summary)
     broker.assert_no_open_orders()
     if any(str(o.client_order_id).startswith(f"eod-v1-{day:%Y%m%d}-") for o in broker.orders(day)):
         summary["reason"] = "Bot orders already exist today; conservative no-retry policy"
         return
     positions = broker.positions()
     assert_portfolio(positions)
+    # Simulations keep their existing no-state/no-mutation behavior. Effective
+    # runs require the same persistent state scope as the independent daily claim.
+    store = None if config.dry_run else (core_store if core_store is not None else
+                                        CoreRecoveryStore(account.id, config.paper))
+    pending = store.pending(day) if store is not None else None
+    if pending is not None:
+        origin = aware(pending["started_at"]).astimezone(NY).date()
+        span = (day-origin).days
+        if not 0 <= span <= MAX_RECOVERY_DAYS:
+            raise StateError("Core recovery history outside bounded date range")
+        if span == 0:
+            summary.update(status="skipped", reason="Core intent already exists today; no same-day retry")
+            return
+        orders, fills = [], []
+        # Include every calendar date: a historical order or FILL may not be
+        # inferred absent merely because a date was not a normal session.
+        for offset in range(span+1):
+            historical_day = origin+timedelta(days=offset)
+            orders.extend(broker.orders(historical_day))
+            fills.extend(broker.fills_today(historical_day))
+        broker.assert_no_open_orders()
+        positions, account = broker.positions(), broker.account()
+        assert_portfolio(positions)
+        validate_account(account)
+        summary["core_recovery"] = reconcile_intent(pending, orders, fills, positions, day)
+        summary["core_recovery"]["status"] = "awaiting_signal"
     broker.assert_assets(UNIVERSE)
     indicators = data.load(UNIVERSE, window, broker, quote_symbols=())
-    decision = core_targets(indicators) if window.weekly_rebalance else None
+    fresh = core_targets(indicators) if window.weekly_rebalance or pending is not None else None
+    decision = fresh if window.weekly_rebalance else (
+        select_recovery_decision(pending, fresh, day) if pending is not None else None)
+    if pending is not None:
+        summary["core_recovery"].update(
+            status="weekly_supersession" if window.weekly_rebalance else
+                   "eligible" if decision is not None else "held_signal_changed",
+            fresh_regime=fresh.regime, fresh_targets=fresh.targets)
     summary.update(regime=decision.regime if decision else "HOLD_UNTIL_WEEK_END",
                    core_targets=decision.targets if decision else {},
                    core_scores=decision.scores if decision else {},
                    signal_as_of=indicators["SPY"].as_of)
+    intent = pending
+
+    def before_orders():
+        nonlocal intent
+        if decision is not None and window.weekly_rebalance:
+            intent = store.begin(day, decision, positions, account.equity,
+                                 started_at=clock.timestamp,
+                                 signal_as_of=indicators["SPY"].as_of, supersedes=pending)
+        if intent is not None:
+            summary.setdefault("core_recovery", {}).update(
+                intent_date=intent["session_date"], pending=True)
+
+    def after_core(current, prices, final_account, active):
+        if intent is None:
+            return True
+        if decision is None:
+            summary["core_recovery"]["pending"] = True
+            summary["core_status"] = "held_signal_changed"
+            return False
+        protected = [p["symbol"] for p in summary["protected"] if p["symbol"] in CORE]
+        finished = store.finish(intent, day, current, prices, final_account.equity,
+                                protected=protected, frozen=not active)
+        summary.setdefault("core_recovery", {}).update(
+            pending=not finished, status="completed" if finished else "pending_allocation")
+        return finished
+
     from .execution import execute_strategy
-    execute_strategy(config, broker, data, summary, window, account, positions, indicators, decision, claim)
+    execute_strategy(config, broker, data, summary, window, account, positions, indicators, decision, claim,
+                     before_orders=before_orders, after_core=after_core)
 
 
 def main():

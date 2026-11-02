@@ -12,7 +12,7 @@ import unittest
 from src.bot import Config, run
 from src.quotes import QuoteBatch, QuoteFatalError, QuoteSnapshot, inspect_quote
 from src.safety import NY, SafetyError
-from tests.test_bot import FakeBroker, indicators, position
+from tests.test_bot import empty_core_store, FakeBroker, indicators, position
 
 
 WEDNESDAY = datetime(2026, 10, 21, 15, 45, tzinfo=NY)
@@ -107,7 +107,7 @@ class DegradedExecutionTests(unittest.TestCase):
 
     def run_bot(self, broker, data, *, dry_run=False):
         run(Config("fake-key", "fake-secret", True, dry_run, "iex"),
-            broker, data, self.summary, claim=self.claim, observe=self.observe)
+            broker, data, self.summary, claim=self.claim, observe=self.observe, core_store=empty_core_store())
         return self.summary
 
     @staticmethod

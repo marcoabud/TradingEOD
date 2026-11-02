@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 from src.bot import Config, run
 from src.safety import SafetyError
-from tests.test_bot import position
+from tests.test_bot import empty_core_store, position
 from tests.test_degraded_execution import FRIDAY, GuardedBroker, QuoteData
 
 
@@ -23,7 +23,7 @@ class ResilienceRegressions(unittest.TestCase):
         summary = {}
         with self.assertRaisesRegex(SafetyError, "partial fill"):
             run(Config("fake", "fake", True, False, "iex"), broker, QuoteData(), summary,
-                claim=Mock(return_value=True), observe=Mock(return_value=True))
+                claim=Mock(return_value=True), observe=Mock(return_value=True), core_store=empty_core_store())
         self.assertEqual([o["side"] for o in summary["orders"]], ["sell"])
         self.assertEqual(summary["core_status"], "incomplete")
 
@@ -42,7 +42,7 @@ class ResilienceRegressions(unittest.TestCase):
                 summary = {}
                 with self.assertRaisesRegex(SafetyError, "unconfirmed buy"):
                     run(Config("fake", "fake", True, False, "iex"), broker, QuoteData(), summary,
-                        claim=Mock(return_value=True), observe=Mock(return_value=True))
+                        claim=Mock(return_value=True), observe=Mock(return_value=True), core_store=empty_core_store())
                 self.assertEqual([o["side"] for o in summary["orders"]], ["buy"])
                 self.assertEqual(summary["orders"][0]["status"], order_status)
                 self.assertEqual(summary["core_status"], "incomplete")
@@ -56,7 +56,7 @@ class ResilienceRegressions(unittest.TestCase):
         broker.before_submission = expire_quote
         summary = {}
         run(Config("fake", "fake", True, False, "iex"), broker, QuoteData(), summary,
-            claim=Mock(return_value=True), observe=Mock(return_value=True))
+            claim=Mock(return_value=True), observe=Mock(return_value=True), core_store=empty_core_store())
         self.assertEqual(summary["orders"], [])
         self.assertEqual(summary["core_status"], "frozen")
 

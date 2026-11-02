@@ -2,7 +2,7 @@
 
 Motor EOD de Alpaca para una cuenta dedicada de aproximadamente USD 4,000. Lee el equity real en cada ejecución, asigna 70% a Dual Momentum semanal y hasta 30% a dos posiciones RSI(2). Las credenciales, el capital y las señales no están incorporados en el código.
 
-**Estado de entrega, 23 de octubre de 2026:** implementación con pruebas automatizadas en Python 3.12, recuperación acotada de cotizaciones y omisiones por activo. El 22 de octubre el bot evaluó a tiempo, confirmó Telegram y no operó porque ninguno de los doce swings cumplía RSI(2)<10; el core no correspondía ese jueves. La nueva versión añade medición automática de sesiones paper. Siguen pendientes diez sesiones observadas, dos evaluaciones semanales y comprobar compras y posteriores ventas reales en paper. No hay backtest ni evidencia de rentabilidad incluida.
+**Estado de entrega, 1 de noviembre de 2026:** implementación paper con pruebas automatizadas en Python 3.12. Añade conciliación acotada de órdenes propias recién llenadas, recuperación persistente de objetivos core incompletos y comparación histórica separada del trading. El incidente del 30 de octubre dejó el rebalanceo incompleto después de vender SPY y QQQ; completar un objetivo requiere reconciliar los fills y revalidar señales, precios, efectivo y horario en una sesión posterior. Las variantes defensivas diarias y de trailing no están activadas. Las pruebas y los resultados paper no certifican rentabilidad ni preparación para dinero real.
 
 ## Archivos
 
@@ -20,6 +20,8 @@ Motor EOD de Alpaca para una cuenta dedicada de aproximadamente USD 4,000. Lee e
 | `src/diagnostics.py` | Conectividad Alpaca paper y Telegram sin enviar órdenes |
 | `src/market_diagnostics.py`, `src/signal_diagnostics.py` | Reconstrucción de cotizaciones y señales históricas sin operar |
 | `src/state.py` | Registro persistente por cuenta, fecha de Nueva York y modo |
+| `src/core_recovery.py` | Objetivos core inmutables y conciliación entre sesiones |
+| `src/research.py`, `src/research_data.py` | Comparación histórica offline y exportación GET de datos ajustados |
 | `src/notifier.py` | Webhook JSON y Telegram opcionales |
 | `.github/workflows/daily_trading.yml` | Ejecución programada y manual |
 | `.github/workflows/test_telegram.yml` | Prueba manual de Telegram sin acceso a Alpaca |
@@ -28,8 +30,23 @@ Motor EOD de Alpaca para una cuenta dedicada de aproximadamente USD 4,000. Lee e
 | `.github/workflows/observe_paper.yml` | Observación automática tras las ejecuciones paper |
 | `docs/DATOS_FUTUROS.md` | Criterios para evaluar un proveedor externo más económico |
 | `.github/workflows/ci.yml` | Pruebas sin credenciales ni acceso al broker |
+| `.github/workflows/research.yml`, `docs/RESEARCH.md` | Investigación histórica y metodología sin activar reglas |
 | `tests/` | Pruebas de indicadores, ejecución, estado, calendario y notificaciones |
 | `setup_and_push.sh` | Instalador autocontenido y publicación Git sin force-push |
+
+## Conciliación y recuperación del core
+
+Las órdenes abiertas siguen bloqueando la cuenta. El bot registra sus identificadores, símbolos, estados y timestamps en `open_order_checks`. Solo puede volver a consultar brevemente una orden propia confirmada como completamente llenada por ese mismo proceso hace menos de 30 segundos: hasta tres consultas y presupuesto de seis segundos, comprobado después de cada llamada. Una llamada HTTP en curso conserva su timeout; si excede el presupuesto, se bloquea. Para continuar, la lista de órdenes abiertas debe quedar realmente vacía, el fill individual debe coincidir y deben conciliarse posiciones, efectivo y horario. No se ignoran órdenes ajenas o ambiguas ni se reenvían órdenes.
+
+Antes de enviar órdenes de una evaluación semanal se guarda un objetivo core inmutable en `eod-state`, bajo `core-recovery/<modo>/<hash-cuenta>`. Un resultado incompleto permanece pendiente. En una nueva sesión válida, durante un máximo de 35 días, se contrastan todas las órdenes y actividades FILL desde su origen con las cantidades actuales. Solo se continúa fuera del viernes si la señal recalculada conserva exactamente el régimen y los pesos originales. Si cambió, el core queda en espera y los swings conservan sus reglas. Una nueva evaluación semanal puede sustituir el objetivo anterior después de conciliarlo. La finalización requiere posiciones dentro de la banda del 3%, sin posiciones core protegidas o datos que impidan verificarlo. Se descargan nuevas cotizaciones después de los fills y se comprueban otra vez su vigencia y el horario antes de guardar la finalización; una omisión conserva el objetivo pendiente.
+
+Cada sesión sigue necesitando su permiso diario independiente; el objetivo pendiente no autoriza órdenes fuera de horario ni repeticiones del mismo día. Las simulaciones no leen ni modifican el registro de recuperación. El aviso identifica si equity/P&L corresponde a la lectura inicial de una evaluación interrumpida. Los registros deben conservarse; no deben borrarse para intentar repetir operaciones.
+
+## Comparación histórica sin activar reglas
+
+`Historical Strategy Research` exporta datos SIP diarios ajustados mediante consultas GET y compara la base semanal con salida defensiva diaria y trailing EOD del bloque core al 5% y 10%. Utiliza 250 sesiones de calentamiento, separación cronológica 60%/40% y costes de 1/5/10 puntos básicos por lado. Los resultados, datos y hashes quedan como artifacts. No utiliza órdenes, posiciones, estado de trading ni Telegram; las credenciales solo están disponibles en el paso de descarga.
+
+La primera comparación usa precios ajustados de cierre como aproximación: no reproduce cotizaciones ejecutables a las 15:45. El universo fijo introduce sesgo de selección y las cifras no prueban rentabilidad ni habilitan nuevas reglas. Véase [metodología y ejecución](docs/RESEARCH.md). Las reglas defensivas diarias y de trailing permanecen exclusivamente en investigación.
 
 ## Despliegue en GitHub
 

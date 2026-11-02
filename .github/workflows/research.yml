@@ -1,0 +1,48 @@
+name: Historical Strategy Research
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/research_data.py'
+      - 'src/research.py'
+      - '.github/workflows/research.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  historical-comparison:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Export adjusted history using GET requests only
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: python -m src.research_data --start 2020-06-01 --end 2026-10-30 --output research_data
+      - name: Compare fixed variants without broker credentials
+        run: python -m src.research --input research_data --output research_results --initial-equity 4000 --cost-bps 1 5 10
+      - name: Preserve research evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: historical-research-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            research_data
+            research_results
+          if-no-files-found: warn
+          retention-days: 90
