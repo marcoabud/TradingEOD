@@ -1,0 +1,112 @@
+{
+  "intent": {
+    "schema": 1,
+    "account_hash": "ba8a3aeebf4a89eb",
+    "mode": "paper",
+    "session_date": "2026-10-30",
+    "started_at": "2026-10-30T15:45:00.013342-04:00",
+    "signal_as_of": "2026-10-29",
+    "regime": "RISK-OFF",
+    "targets": {
+      "SGOV": "0.7"
+    },
+    "initial_core_qty": {
+      "SPY": "1.841321657",
+      "QQQ": "1.986672078",
+      "SMH": "0",
+      "GLD": "0",
+      "SGOV": "0"
+    },
+    "equity": "3956.85",
+    "source_revision": "beed428c8be236e656a13e04ca672c9f6c9929ff",
+    "origin": "verified_import",
+    "source_evidence": {
+      "artifact_id": 13006682237,
+      "digest": "282c580364ffb2837de8c1210afe5d283bc625113b3e8f6e5c332b8bf92cca14"
+    },
+    "supersedes": null
+  },
+  "orders": [
+    {
+      "id": "qqq-order",
+      "symbol": "QQQ",
+      "side": "sell",
+      "status": "filled",
+      "client_order_id": "eod-v1-20261030-s-QQQ",
+      "created_at": "2026-10-30T19:45:15.262056+00:00",
+      "submitted_at": "2026-10-30T19:45:17.407844+00:00",
+      "updated_at": "2026-10-30T19:45:19.111106+00:00",
+      "filled_at": "2026-10-30T19:45:19.109428+00:00",
+      "qty": "1.986672078",
+      "filled_qty": "1.986672078",
+      "filled_avg_price": "688.05"
+    },
+    {
+      "id": "spy-order",
+      "symbol": "SPY",
+      "side": "sell",
+      "status": "filled",
+      "client_order_id": "eod-v1-20261030-s-SPY",
+      "created_at": "2026-10-30T19:45:08.876455+00:00",
+      "submitted_at": "2026-10-30T19:45:12.329982+00:00",
+      "updated_at": "2026-10-30T19:45:13.255140+00:00",
+      "filled_at": "2026-10-30T19:45:13.253480+00:00",
+      "qty": "1.841321657",
+      "filled_qty": "1.841321657",
+      "filled_avg_price": "753.42"
+    }
+  ],
+  "fills": [
+    {
+      "id": "activity-0",
+      "order_id": "spy-order",
+      "symbol": "SPY",
+      "side": "sell",
+      "qty": "1",
+      "price": "753.42",
+      "transaction_time": "2026-10-30T19:45:13.25348Z",
+      "activity_type": "FILL",
+      "type": "fill"
+    },
+    {
+      "id": "activity-1",
+      "order_id": "spy-order",
+      "symbol": "SPY",
+      "side": "sell",
+      "qty": "0.841321657",
+      "price": "753.42",
+      "transaction_time": "2026-10-30T19:45:13.255043Z",
+      "activity_type": "FILL",
+      "type": "partial_fill"
+    },
+    {
+      "id": "activity-2",
+      "order_id": "qqq-order",
+      "symbol": "QQQ",
+      "side": "sell",
+      "qty": "1",
+      "price": "688.05",
+      "transaction_time": "2026-10-30T19:45:19.109428Z",
+      "activity_type": "FILL",
+      "type": "fill"
+    },
+    {
+      "id": "activity-3",
+      "order_id": "qqq-order",
+      "symbol": "QQQ",
+      "side": "sell",
+      "qty": "0.986672078",
+      "price": "688.05",
+      "transaction_time": "2026-10-30T19:45:19.111025Z",
+      "activity_type": "FILL",
+      "type": "partial_fill"
+    }
+  ],
+  "positions": {
+    "COST": {
+      "symbol": "COST",
+      "qty": "0.605861195"
+    }
+  },
+  "through_day": "2026-11-02"
+}

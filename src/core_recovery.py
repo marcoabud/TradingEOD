@@ -225,13 +225,20 @@ def reconcile_intent(intent, orders, fills, positions, through_day):
                 filled_at = aware(_get(order, "filled_at")).astimezone(NY)
                 if filled <= 0 or filled_at < submitted or filled_at.date() > today:
                     raise SafetyError("Core recovery found inconsistent fill timestamp or quantity")
+                # Alpaca can record a fractional leg after filled_at but before
+                # updated_at on an order already marked fully filled. Bound the
+                # activity by the verified order snapshot, not its first fill.
+                updated_raw = _get(order, "updated_at")
+                evidence_until = aware(updated_raw).astimezone(NY) if updated_raw is not None else filled_at
+                if evidence_until < filled_at or evidence_until.date() > today:
+                    raise SafetyError("Core recovery found inconsistent order update timestamp")
                 _number(_get(order, "filled_avg_price"), positive=True)
                 if side == "sell" and abs(_number(_get(order, "qty")) - filled) > QTY_TOLERANCE:
                     raise SafetyError("Core recovery sell was not fully filled")
             elif status not in {"canceled", "expired", "rejected"} or filled != 0:
                 raise SafetyError("Core recovery found unresolved or partially filled order")
             relevant[order_id] = (symbol, side, filled, submitted,
-                                  filled_at if status == "filled" else None)
+                                  evidence_until if status == "filled" else None)
             clients.add(client_id)
             sums[order_id] = ZERO
         for fill in fills:
@@ -243,10 +250,11 @@ def reconcile_intent(intent, orders, fills, positions, through_day):
             stamp = aware(_get(fill, "transaction_time")).astimezone(NY)
             if (not isinstance(activity_id, str) or not activity_id or activity_id in activities
                     or order_id not in relevant or relevant[order_id][:2] != (symbol, side)
-                    or not first_day <= stamp.date() <= today or stamp < started
-                    or stamp < relevant[order_id][3]
-                    or relevant[order_id][4] is None or stamp > relevant[order_id][4]):
+                    or not first_day <= stamp.date() <= today or stamp < started):
                 raise SafetyError("Core recovery FILL identity does not match verified orders")
+            if (stamp < relevant[order_id][3] or relevant[order_id][4] is None
+                    or stamp > relevant[order_id][4]):
+                raise SafetyError(f"Core recovery FILL timestamp outside verified order snapshot: {symbol}")
             qty = _number(_get(fill, "qty"), positive=True)
             sums[order_id] += qty
             expected[symbol] += qty if side == "buy" else -qty

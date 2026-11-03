@@ -1,6 +1,9 @@
 name: Paper Recovery Contract Check
 on:
   workflow_dispatch:
+  workflow_run:
+    workflows: ['Daily EOD Trading']
+    types: [completed]
   push:
     branches: [main]
     paths:
@@ -12,7 +15,7 @@ permissions:
   contents: read
 jobs:
   read-only-paper:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && (github.event_name != 'workflow_run' || (github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.conclusion == 'failure'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
