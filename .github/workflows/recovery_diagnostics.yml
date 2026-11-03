@@ -1,0 +1,38 @@
+name: Paper Recovery Contract Check
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/recovery_diagnostics.py'
+      - 'src/core_recovery.py'
+      - 'src/broker.py'
+      - '.github/workflows/recovery_diagnostics.yml'
+permissions:
+  contents: read
+jobs:
+  read-only-paper:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Inspect paper evidence without sending orders
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python -m src.recovery_diagnostics
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: recovery-contract-${{ github.run_id }}
+          path: recovery_diagnostics.json
+          retention-days: 30
