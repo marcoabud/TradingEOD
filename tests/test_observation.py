@@ -12,7 +12,7 @@ import zipfile
 
 import requests
 
-from src.observation import (MAX_BYTES, ObservationError, PaperData, aggregate, automatic_campaign,
+from src.observation import (MAX_BYTES, ObservationError, CampaignCollectionError, CampaignReader, PaperData, aggregate, automatic_campaign,
                              fetch_observations, fetch_summary,
                              instant_ns, observe, parse_summary_zip, samples_from_summary,
                              wait_for_delayed_sip)
@@ -471,6 +471,105 @@ class AutomaticCampaignTests(unittest.TestCase):
         with self.assertRaisesRegex(ObservationError, "time budget"):
             fetch_observations(session, REPO, "private-token", monotonic=Mock(side_effect=[0, 0, 121]))
         self.assertEqual(session.get.call_count, 1)
+
+    def test_transient_http_and_transport_errors_retry_without_duplicate_reports(self):
+        for first in (response(status=503), requests.Timeout("private-url-token")):
+            session = self.session()
+            session.get.side_effect = [first, *list(session.get.side_effect)]
+            sleep = Mock()
+            result = fetch_observations(session, REPO, "private-token", sleeper=sleep)
+            self.assertEqual(result, [self.source_report()])
+            self.assertEqual(session.get.call_count, 5)
+            sleep.assert_called_once_with(1)
+
+    def test_permanent_status_is_not_retried_and_reports_safe_status(self):
+        for status in (401, 403, 404):
+            session, sleep = Mock(), Mock()
+            session.get.return_value = response(status=status)
+            with self.assertRaises(CampaignCollectionError) as caught:
+                fetch_observations(session, REPO, "private-token", sleeper=sleep)
+            self.assertEqual(caught.exception.diagnostic["http_status"], status)
+            self.assertEqual(caught.exception.diagnostic["stage"], "listing")
+            self.assertEqual(session.get.call_count, 1)
+            sleep.assert_not_called()
+
+    def test_retry_count_and_rate_limit_wait_are_bounded(self):
+        for headers, expected_requests in (({}, 3), ({"Retry-After": "300"}, 1)):
+            session, sleep = Mock(), Mock()
+            session.get.return_value = response(status=429, headers=headers)
+            with self.assertRaises(CampaignCollectionError) as caught:
+                fetch_observations(session, REPO, "private-token", sleeper=sleep)
+            self.assertEqual(session.get.call_count, expected_requests)
+            self.assertEqual(caught.exception.diagnostic["retries"], expected_requests - 1)
+            self.assertLessEqual(sum(call.args[0] for call in sleep.call_args_list), 3)
+
+    def test_retry_does_not_escape_total_deadline(self):
+        session, sleep = Mock(), Mock()
+        session.get.return_value = response(status=503)
+        reader = CampaignReader(session, sleeper=sleep, monotonic=Mock(side_effect=[0, 119.5, 119.5]))
+        with self.assertRaises(ObservationError):
+            reader.get(session, "https://api.github.com/test")
+        self.assertEqual(session.get.call_count, 1)
+        self.assertEqual(session.get.call_args.kwargs["timeout"], (.25, .25))
+        sleep.assert_not_called()
+
+    def test_partial_verified_history_survives_failure_of_later_artifact(self):
+        session = self.session()
+        replies = list(session.get.side_effect)
+        item = json.loads(replies[0].iter_content.return_value[0])["artifacts"][0]
+        other = dict(item, id=889, name="paper-observation-1235-5556-1", workflow_run={"id": 5556})
+        replies[0] = response({"artifacts": [item, other]})
+        session.get.side_effect = replies + [response(status=503) for _ in range(3)]
+        with self.assertRaises(CampaignCollectionError) as caught:
+            fetch_observations(session, REPO, "private-token", sleeper=Mock())
+        self.assertEqual(caught.exception.reports, [self.source_report()])
+        self.assertEqual(caught.exception.diagnostic["stage"], "provenance")
+        self.assertEqual(caught.exception.diagnostic["http_status"], 503)
+        current = dict(self.source_report(), run_id="1235", session_date="2026-10-26")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "current.json"
+            path.write_text(json.dumps(current), encoding="utf-8")
+            with patch("src.observation.fetch_observations", side_effect=caught.exception), \
+                 patch("src.observation.PaperData") as data:
+                report = automatic_campaign({"GITHUB_REPOSITORY": REPO}, Mock(), path)
+        self.assertEqual(report["distinct_sessions"], 2)
+        self.assertFalse(report["history_complete"])
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["status"], "incomplete")
+        self.assertNotIn("private-token", json.dumps(report))
+        data.assert_not_called()
+
+    def test_signed_download_retry_never_receives_github_credentials(self):
+        session = self.session()
+        replies = list(session.get.side_effect)
+        session.get.side_effect = replies[:-1] + [response(status=502), replies[-1]]
+        self.assertEqual(fetch_observations(session, REPO, "private-token", sleeper=Mock()), [self.source_report()])
+        for call in session.get.call_args_list[-2:]:
+            self.assertEqual(call.kwargs["headers"], {})
+        session.post.assert_not_called()
+
+    def test_digest_mismatch_is_not_retried_or_counted(self):
+        session = self.session()
+        replies = list(session.get.side_effect)
+        replies[-1] = response(raw=archive({"forged": True}, "paper_observation_report.json"))
+        session.get.side_effect = replies
+        sleep = Mock()
+        with self.assertRaises(CampaignCollectionError) as caught:
+            fetch_observations(session, REPO, "private-token", sleeper=sleep)
+        self.assertEqual(caught.exception.reports, [])
+        self.assertEqual(caught.exception.diagnostic["code"], "validation_failed")
+        self.assertEqual(session.get.call_count, 4)
+        sleep.assert_not_called()
+
+    def test_history_only_needs_no_current_file_or_broker_credentials(self):
+        with patch("src.observation.fetch_observations", return_value=[self.source_report()]), \
+             patch("src.observation.PaperData") as data, \
+             patch("src.observation.Path.read_bytes") as read:
+            report = automatic_campaign({"GITHUB_REPOSITORY": REPO}, Mock(), "nonexistent.json", history_only=True)
+        self.assertTrue(report["history_complete"])
+        self.assertEqual(report["distinct_sessions"], 1)
+        data.assert_not_called()
+        read.assert_not_called()
 
 
 if __name__ == "__main__":

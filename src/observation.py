@@ -38,6 +38,66 @@ TIMESTAMP = re.compile(r"^(\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?(Z|
 class ObservationError(ValueError):
     """Only fixed, non-provider diagnostics may be used as messages."""
 
+    def __init__(self, message, *, code="validation_failed", status=None, retryable=False, retry_after=0):
+        super().__init__(message)
+        self.code = code
+        self.status = status
+        self.retryable = retryable
+        self.retry_after = retry_after
+
+
+class CampaignCollectionError(ObservationError):
+    """Preserve reports verified before a later collection failure."""
+
+    def __init__(self, error, reports, diagnostic):
+        super().__init__(str(error))
+        self.reports = list(reports)
+        self.diagnostic = diagnostic
+
+
+class CampaignReader:
+    """Bounded retries for historical GitHub reads only; never broker calls."""
+
+    def __init__(self, session, *, monotonic=time.monotonic, sleeper=time.sleep):
+        self.session, self.monotonic, self.sleeper = session, monotonic, sleeper
+        self.began = monotonic()
+        self.stage = "listing"
+        self.page = self.artifact_id = None
+        self.requests = self.retries = 0
+
+    def check_budget(self):
+        elapsed = self.monotonic() - self.began
+        if not math.isfinite(elapsed) or elapsed < 0 or elapsed >= 120:
+            raise ObservationError("Campaign collection time budget exhausted", code="time_budget")
+        return 120 - elapsed
+
+    def get(self, session, url, **kwargs):
+        for attempt in range(3):
+            remaining = self.check_budget()
+            self.requests += 1
+            try:
+                return _get(session, url, **kwargs,
+                            timeout=(min(3.05, remaining / 2), min(8, remaining / 2)))
+            except ObservationError as error:
+                if not error.retryable or attempt == 2:
+                    raise
+                delay = max(2 ** attempt, error.retry_after)
+                # A long rate-limit wait cannot fit this job; do not hammer it.
+                if delay > 8 or delay >= self.check_budget():
+                    raise
+                self.retries += 1
+                self.sleeper(delay)
+
+    def diagnostic(self, error):
+        # Never serialize exception text, URLs, headers, bodies or credentials.
+        code = error.code if error.code in {
+            "transport", "http_status", "time_budget", "collection_limit", "validation_failed"
+        } else "validation_failed"
+        return {"stage": self.stage, "code": code,
+                "page": self.page, "artifact_id": self.artifact_id,
+                "http_status": error.status if type(error.status) is int and 100 <= error.status <= 599 else None,
+                "requests": self.requests, "retries": self.retries}
+
 
 def instant_ns(value):
     """Compare nanoseconds without losing precision to Python datetime rounding."""
@@ -94,20 +154,26 @@ def _body(response):
                 raise ObservationError("Response exceeds observation size limit")
         return bytes(result)
     except requests.RequestException:
-        raise ObservationError("Observation download failed") from None
+        raise ObservationError("Observation download failed", code="transport", retryable=True) from None
 
 
-def _get(session, url, *, headers=None, params=None, redirect=False):
+def _get(session, url, *, headers=None, params=None, redirect=False, timeout=(3.05, 8)):
     try:
         response = session.get(url, headers=headers or {}, params=params,
-                               timeout=(3.05, 8), allow_redirects=False, stream=True)
+                               timeout=timeout, allow_redirects=False, stream=True)
     except requests.RequestException:
-        raise ObservationError("Observation GET failed") from None
+        raise ObservationError("Observation GET failed", code="transport", retryable=True) from None
     try:
         if redirect and response.status_code == 302:
             return response.headers.get("Location", "")
         if response.status_code != 200:
-            raise ObservationError("Observation GET returned an unsuccessful status")
+            delay = number(response.headers.get("Retry-After"))
+            limited = response.status_code == 403 and (
+                response.headers.get("X-RateLimit-Remaining") == "0" or "Retry-After" in response.headers)
+            raise ObservationError("Observation GET returned an unsuccessful status", code="http_status",
+                                   status=response.status_code,
+                                   retryable=response.status_code in (408, 429, 500, 502, 503, 504) or limited,
+                                   retry_after=max(0, delay or 0))
         return _body(response)
     finally:
         response.close()
@@ -133,13 +199,13 @@ def parse_summary_zip(raw, *, filename="run_summary.json"):
         raise ObservationError("Invalid summary artifact archive") from None
 
 
-def download_artifact(session, base, artifact, headers, *, filename):
+def download_artifact(session, base, artifact, headers, *, filename, getter=_get):
     """Read one allowlisted JSON member; credentials never reach signed hosts."""
     aid, size = artifact.get("id"), artifact.get("size_in_bytes")
     if (artifact.get("expired") is not False or not isinstance(aid, int) or isinstance(aid, bool) or aid <= 0
             or not isinstance(size, int) or isinstance(size, bool) or not 0 < size <= MAX_BYTES):
         raise ObservationError("Invalid artifact identity or size")
-    location = _get(session, f"{base}/actions/artifacts/{aid}/zip", headers=headers, redirect=True)
+    location = getter(session, f"{base}/actions/artifacts/{aid}/zip", headers=headers, redirect=True)
     if not isinstance(location, str):
         raise ObservationError("Artifact download did not return a signed location")
     try:
@@ -152,7 +218,7 @@ def download_artifact(session, base, artifact, headers, *, filename):
         valid = False
     if not valid:
         raise ObservationError("Artifact download host is not allowed")
-    raw = _get(session, location)  # Deliberately never forward the GitHub token.
+    raw = getter(session, location)  # Deliberately never forward the GitHub token.
     digest = artifact.get("digest")
     if digest is not None and digest != "sha256:" + sha256(raw).hexdigest():
         raise ObservationError("Artifact digest verification failed")
@@ -471,7 +537,16 @@ def aggregate(paths, *, start=DEFAULT_START):
     return aggregate_reports(reports, start=start)
 
 
-def fetch_observations(session, repo, token, *, start=DEFAULT_START, monotonic=time.monotonic):
+def fetch_observations(session, repo, token, *, start=DEFAULT_START, monotonic=time.monotonic, sleeper=time.sleep):
+    reports = []
+    reader = CampaignReader(session, monotonic=monotonic, sleeper=sleeper)
+    try:
+        return _fetch_observations(session, repo, token, start=start, reader=reader, reports=reports)
+    except ObservationError as error:
+        raise CampaignCollectionError(error, reports, reader.diagnostic(error)) from None
+
+
+def _fetch_observations(session, repo, token, *, start, reader, reports):
     """Retrieve bounded historical reports only from this repository's trusted observer.
 
     All artifact names, workflow identity, branch, repository and event are
@@ -484,16 +559,11 @@ def fetch_observations(session, repo, token, *, start=DEFAULT_START, monotonic=t
     base = f"https://api.github.com/repos/{repo}"
     headers = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}",
                "X-GitHub-Api-Version": "2022-11-28"}
-    reports, verified_runs, artifacts = [], {}, []
-    began = monotonic()
-    def check_budget():
-        elapsed = monotonic() - began
-        if not math.isfinite(elapsed) or elapsed < 0 or elapsed >= 120:
-            raise ObservationError("Campaign collection time budget exhausted")
+    verified_runs, artifacts = {}, []
     # Pagination is bounded; exhaustion is an incomplete audit, never success.
     for page in range(1, 11):
-        check_budget()
-        listing = _json(_get(session, f"{base}/actions/artifacts", headers=headers,
+        reader.page = page
+        listing = _json(reader.get(session, f"{base}/actions/artifacts", headers=headers,
                             params={"per_page": 100, "page": page}))
         items = listing.get("artifacts")
         if not isinstance(items, list):
@@ -512,19 +582,22 @@ def fetch_observations(session, repo, token, *, start=DEFAULT_START, monotonic=t
                 raise ObservationError("Campaign observation artifact has expired")
             artifacts.append((item, match.groups()))
             if len(artifacts) > 100:
-                raise ObservationError("Campaign observation count exceeds collection limit")
+                raise ObservationError("Campaign observation count exceeds collection limit", code="collection_limit")
         if len(items) < 100:
             break
     else:
-        raise ObservationError("Campaign artifact listing exceeds collection limit")
+        raise ObservationError("Campaign artifact listing exceeds collection limit", code="collection_limit")
     for artifact, (source_run, observer_run, observer_attempt) in artifacts:
-        check_budget()
+        reader.stage = "provenance"
+        aid = artifact.get("id")
+        reader.artifact_id = aid if type(aid) is int and aid > 0 else None
+        reader.check_budget()
         origin = artifact.get("workflow_run")
         if not isinstance(origin, dict) or origin.get("id") != int(observer_run):
             raise ObservationError("Observation artifact provenance mismatch")
         key = (observer_run, observer_attempt)
         if key not in verified_runs:
-            run = _json(_get(session, f"{base}/actions/runs/{observer_run}/attempts/{observer_attempt}", headers=headers))
+            run = _json(reader.get(session, f"{base}/actions/runs/{observer_run}/attempts/{observer_attempt}", headers=headers))
             head_repo = run.get("head_repository")
             verified_runs[key] = (run.get("id") == int(observer_run)
                     and run.get("run_attempt") == int(observer_attempt)
@@ -536,32 +609,42 @@ def fetch_observations(session, repo, token, *, start=DEFAULT_START, monotonic=t
                     and run.get("name") == "Observe Paper Quotes")
         if not verified_runs[key]:
             continue
-        check_budget()
-        report = download_artifact(session, base, artifact, headers, filename="paper_observation_report.json")
+        reader.stage = "artifact"
+        reader.check_budget()
+        report = download_artifact(session, base, artifact, headers, filename="paper_observation_report.json", getter=reader.get)
+        reader.stage = "identity"
         if str(report.get("run_id")) != source_run or str(report.get("repository", "")).lower() != repo.lower():
             raise ObservationError("Campaign report identity mismatch")
         reports.append(report)
     return reports
 
 
-def automatic_campaign(environ, session, current_path="paper_observation_report.json"):
+def automatic_campaign(environ, session, current_path="paper_observation_report.json", *, history_only=False):
     """Current report plus previous verified artifacts; no Alpaca credentials used."""
-    path = Path(current_path)
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_BYTES:
-        raise ObservationError("Current observation report is unavailable")
-    current = _json(path.read_bytes())
+    reports = []
+    if not history_only:
+        path = Path(current_path)
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_BYTES:
+            raise ObservationError("Current observation report is unavailable")
+        reports.append(_json(path.read_bytes()))
     start = environ.get("EOD_OBSERVATION_START_DATE", DEFAULT_START)
-    reports = [current]
     history_complete = True
+    collection_error = None
     try:
         reports += fetch_observations(session, environ.get("GITHUB_REPOSITORY", ""),
                                       environ.get("GITHUB_TOKEN", ""), start=start)
+    except CampaignCollectionError as error:
+        reports += error.reports
+        history_complete = False
+        collection_error = error.diagnostic
     except ObservationError:
         history_complete = False
+        collection_error = {"stage": "collection", "code": "validation_failed"}
     report = aggregate_reports(reports, start=start)
     report.update(status="aggregated" if history_complete else "incomplete", history_complete=history_complete)
     if not history_complete:
-        report.update(complete=False, reason="Historical observation collection unavailable; counts are partial")
+        report.update(complete=False, reason="Historical observation collection unavailable; counts are partial",
+                      collection_error=collection_error)
     return report
 
 
@@ -569,16 +652,19 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Read-only paper quote observation")
     parser.add_argument("--aggregate", nargs="+", metavar="REPORT_JSON")
     parser.add_argument("--campaign", action="store_true", help="Automatically combine this report with prior trusted GitHub observations")
+    parser.add_argument("--history-only", action="store_true", help="With --campaign, read only existing GitHub reports; no current session or Alpaca calls")
     args = parser.parse_args(argv)
     if args.aggregate and args.campaign:
         parser.error("--aggregate and --campaign cannot be combined")
+    if args.history_only and not args.campaign:
+        parser.error("--history-only requires --campaign")
     output = "paper_observation_campaign.json" if args.aggregate or args.campaign else "paper_observation_report.json"
     try:
         if args.aggregate:
             report = aggregate(args.aggregate, start=os.environ.get("EOD_OBSERVATION_START_DATE", DEFAULT_START))
         elif args.campaign:
             with requests.Session() as session:
-                report = automatic_campaign(os.environ, session)
+                report = automatic_campaign(os.environ, session, history_only=args.history_only)
         else:
             with requests.Session() as session:
                 report = observe(os.environ, session)
