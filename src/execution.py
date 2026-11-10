@@ -6,7 +6,15 @@ from types import SimpleNamespace
 from .data import quote_price
 from .quotes import QuoteBudget, QuoteFatalError, inspect_quote
 from .safety import SafetyError, decimal, usable_cash, validate_account, quantity
-from .strategy import SWING_UNIVERSE, StrategyDataError, swing_exit_reasons
+from .strategy import (SWING_UNIVERSE, StrategyDataError, entry_candidate, swing_exit_reasons,
+                       swing_signal)
+
+
+def audit_row(indicator):
+    """Completed-bar values plus the same-session signal actually evaluated."""
+    row = asdict(indicator)
+    row["signal"] = asdict(swing_signal(indicator)) if indicator.price is not None else None
+    return row
 
 
 class QuoteOmission(SafetyError):
@@ -29,15 +37,16 @@ class QuoteSession:
         if row not in self.summary["data_issues"]:
             self.summary["data_issues"].append(row)
 
-    def fetch(self, symbols, phase):
+    def fetch(self, symbols, phase, *, budget=None):
         symbols = tuple(dict.fromkeys(symbols))
+        budget = self.budget if budget is None else budget
         if phase in {"exit_evaluation", "post_sell_valuation", "buy_refresh", "dry_buy_valuation"}:
             for symbol in set(self.indicators) - set(symbols):
                 self.indicators[symbol] = replace(self.indicators[symbol], price=None)
                 self.quotes.pop(symbol, None)
         try:
             batch = self.data.quote_batch(symbols, lambda: self.broker.clock().timestamp,
-                                         budget=self.budget,
+                                         budget=budget,
                                          deadline=self.window.closes-timedelta(minutes=5))
         except QuoteFatalError as exc:
             self.issue("ALL", phase, exc.cause)
@@ -60,7 +69,7 @@ class QuoteSession:
                                                 diagnostics=batch.diagnostics))
         self.summary.update(quote_budget_seconds=round(self.budget.used_seconds, 3),
                             quoted_symbols=[s for s, i in self.indicators.items() if i.price is not None],
-                            indicators={s: asdict(i) for s, i in self.indicators.items()})
+                            indicators={s: audit_row(i) for s, i in self.indicators.items()})
         return set(batch.failures)
 
     def guard(self, symbols, now, *, phase="pre_submit"):
@@ -82,14 +91,34 @@ class QuoteSession:
 
 
 def ranked_candidates(indicators, excluded):
-    return sorted((s for s in SWING_UNIVERSE if s not in excluded and indicators[s].rsi2 < 10),
+    """Frozen pre-order candidate pool; today's quote decides final eligibility.
+
+    With roll state every non-excluded swing symbol stays in the pool, since
+    yesterday's RSI cannot rule out a same-session signal. Fixtures without
+    roll state are final values and keep the RSI<10 prefilter.
+    """
+    return sorted((s for s in SWING_UNIVERSE if s not in excluded
+                   and (indicators[s].roll is not None or indicators[s].rsi2 < 10)),
                   key=lambda s: indicators[s].rsi2)
 
 
 def select_slots(quotes, ranked, occupied):
-    """Unknown eligibility reserves a slot; known trend rejection releases it."""
+    """Pick free-slot entries by lowest same-session RSI2.
+
+    Same-session pool: one single-attempt scan with its own small budget, so
+    venues that persistently fail validation cannot starve order phases. A
+    symbol without a valid quote has no signal today: it is recorded as a data
+    issue and skipped, without reserving a slot.
+    Legacy fixtures: unknown eligibility reserves a slot; known trend
+    rejection releases it.
+    """
     remaining, selected, reserved = max(0, 2-len(set(occupied))), [], []
     pending = list(ranked)
+    if remaining and pending and all(quotes.indicators[s].roll is not None for s in pending):
+        failed = quotes.fetch(pending, "entry_candidates", budget=QuoteBudget(seconds=8, max_attempts=1))
+        eligible = [s for s in pending if s not in failed and entry_candidate(quotes.indicators[s])]
+        eligible.sort(key=lambda s: swing_signal(quotes.indicators[s]).rsi2)
+        return eligible[:remaining], reserved
     while remaining and pending:
         group, pending = pending[:remaining], pending[remaining:]
         failed = quotes.fetch(group, "entry_candidates")
@@ -105,7 +134,7 @@ def select_slots(quotes, ranked, occupied):
 
 
 def execute_strategy(config, broker, data, summary, window, account, positions, indicators, decision, claim,
-                     *, before_orders=None, after_core=None):
+                     *, before_orders=None, after_core=None, exits_only_reason=None):
     # Local import keeps the existing pure allocation helpers available to callers.
     from .bot import CORE, ZERO, assert_portfolio, plan_buys, plan_sells, reserved_cash_amount
 
@@ -113,6 +142,10 @@ def execute_strategy(config, broker, data, summary, window, account, positions, 
     core_active = decision is not None
     core_started = False
     summary["core_status"] = "ready" if core_active else "not_due"
+    exits_only = exits_only_reason is not None
+    if exits_only:
+        # Swing exits still run; no purchase of any block is planned or sent.
+        summary.update(buy_blocked=True, exits_only=True, core_status="blocked")
 
     def freeze_core():
         nonlocal core_active
@@ -338,7 +371,7 @@ def execute_strategy(config, broker, data, summary, window, account, positions, 
     core_finished = after_core(current, q.indicators, account, core_active) if after_core is not None else True
     if core_active:
         summary["core_status"] = "completed" if core_finished else "incomplete"
-    degraded = bool(summary["data_issues"]) or not core_finished
+    degraded = bool(summary["data_issues"]) or not core_finished or exits_only
     outcome = "data_omissions" if degraded else "orders_confirmed" if summary["orders"] else "no_orders_required"
     if not core_finished:
         outcome = "core_recovery_pending"
@@ -346,6 +379,7 @@ def execute_strategy(config, broker, data, summary, window, account, positions, 
                    equity=str(account.equity), pnl_day=str(decimal(account.equity)-decimal(account.last_equity)),
                    cash_remaining=str(account.cash),
                    equity_snapshot="evaluation_end",
-                   reason="Core allocation remains pending; inspect recovery state" if not core_finished else
+                   reason="Core state blocked; swing exits only, no purchases. Inspect recovery state" if exits_only else
+                          "Core allocation remains pending; inspect recovery state" if not core_finished else
                           "Session complete with data omissions; inspect affected assets" if degraded else
                           "Orders confirmed" if summary["orders"] else "No orders required by evaluated signals and holdings")

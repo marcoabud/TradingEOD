@@ -146,6 +146,7 @@ class DataLoadTests(unittest.TestCase):
                              datetime(2026, 10, 16, 16, tzinfo=NY), True)
         self.data = object.__new__(MarketData)
         self.data.feed = DataFeed.SIP
+        self.data.history_feed = DataFeed.SIP
         self.data.client = Mock()
         self.data.prices = Mock(return_value={"SPY": 130, "QQQ": 130})
         self.broker = Mock()
@@ -230,6 +231,7 @@ class QuoteBatchIntegrationTests(unittest.TestCase):
         self.now = datetime(2026, 10, 22, 15, 45, tzinfo=NY)
         self.data = object.__new__(MarketData)
         self.data.feed = DataFeed.IEX
+        self.data.history_feed = DataFeed.IEX
         self.data.client = Mock()
         self.data.quote_transport = Mock(return_value={
             "SPY": {"t": self.now.isoformat(), "bp": 99.9, "ap": 100.1, "bs": 10, "as": 20},

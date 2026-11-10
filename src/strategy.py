@@ -2,9 +2,15 @@
 
 Daily frames must contain completed exchange sessions only.  The caller owns
 calendar, recency, corporate-action adjustments, and quote validation.  At
-15:45 New York time, today's final daily close does not exist: momentum, RSI,
-ATR and moving averages therefore end at the preceding completed session.
-The live quote is used only for swing price-vs-average/stop comparisons.
+15:45 New York time, today's final daily close does not exist.
+
+Swing signals (RSI2, SMA5, SMA200) treat the validated live quote as today's
+provisional close, so a signal and its order belong to the same session: the
+stored rsi2/sma5/sma200 fields remain the completed-bar values for audit, and
+swing_signal() rolls them forward by one observation.  Without this, an entry
+would act on yesterday's oversold reading after today's move already happened.
+Core momentum/volatility and ATR14 still end at the preceding completed
+session (a weekly decision; today's high/low are not reliably known).
 """
 
 from __future__ import annotations
@@ -32,6 +38,24 @@ class StrategyDataError(ValueError):
 
 
 @dataclass(frozen=True)
+class RollState:
+    """Minimum completed-bar state needed to append one provisional close."""
+    last_close: float
+    sum4: float       # last 4 completed closes
+    sum199: float     # last 199 completed closes
+    avg_gain: float   # Wilder RSI(2) averages at the last completed close
+    avg_loss: float
+
+
+@dataclass(frozen=True)
+class SwingSignal:
+    price: float
+    sma5: float
+    sma200: float
+    rsi2: float
+
+
+@dataclass(frozen=True)
 class Indicators:
     symbol: str
     price: float | None
@@ -44,6 +68,9 @@ class Indicators:
     r120: float
     vol60: float
     as_of: str = ""
+    # None means the stored values are already final signal values (unit
+    # fixtures, explicitly lagged research). compute_indicators always sets it.
+    roll: RollState | None = None
 
     def __post_init__(self) -> None:
         if self.price is not None:
@@ -82,6 +109,44 @@ def require_current_price(indicator: Indicators) -> float:
     return price
 
 
+def swing_signal(indicator: Indicators) -> SwingSignal:
+    """Signal values with the live quote as today's provisional close.
+
+    Requires an explicit current price. RSI(2) advances one Wilder step:
+    avg = (previous + today's change) / 2. Flat/no-loss conventions match
+    wilder_rsi. ATR is intentionally not rolled.
+    """
+    price = require_current_price(indicator)
+    state = indicator.roll
+    if state is None:
+        return SwingSignal(price, indicator.sma5, indicator.sma200, indicator.rsi2)
+    change = price - state.last_close
+    gain = (state.avg_gain + max(change, 0.0)) / 2
+    loss = (state.avg_loss + max(-change, 0.0)) / 2
+    rsi = (100.0 if gain > 0 else 50.0) if loss == 0 else 100.0 - 100.0 / (1.0 + gain / loss)
+    result = SwingSignal(price, (state.sum4 + price) / 5, (state.sum199 + price) / 200, rsi)
+    if not all(math.isfinite(v) for v in (result.sma5, result.sma200, result.rsi2)):
+        raise StrategyDataError(f"{indicator.symbol}: non-finite live signal")
+    return result
+
+
+def entry_eligible(indicator: Indicators) -> bool:
+    """RSI2 below 10 and price above SMA200, both including today's quote."""
+    signal = swing_signal(indicator)
+    return signal.rsi2 < 10 and signal.price > signal.sma200
+
+
+def entry_candidate(indicator: Indicators) -> bool:
+    """entry_eligible, where a missing quote means "no signal today".
+
+    Fixtures without roll state keep the strict legacy rule: a qualifying
+    stored RSI without a current quote is an error, never a silent pass.
+    """
+    if indicator.roll is None:
+        return indicator.rsi2 < 10 and require_current_price(indicator) > indicator.sma200
+    return indicator.price is not None and entry_eligible(indicator)
+
+
 def _numeric_array(values: Sequence[float], name: str) -> np.ndarray:
     try:
         result = np.asarray(values, dtype=float)
@@ -104,6 +169,12 @@ def _wilder_last(values: np.ndarray, period: int) -> float:
     return average
 
 
+def _wilder_averages(values: np.ndarray, period: int) -> tuple[float, float]:
+    changes = np.diff(values)
+    return (_wilder_last(np.maximum(changes, 0.0), period),
+            _wilder_last(np.maximum(-changes, 0.0), period))
+
+
 def wilder_rsi(closes: Sequence[float], period: int = 2) -> float:
     """Wilder RSI; flat prices return 50, only gains 100, only losses 0.
 
@@ -113,9 +184,7 @@ def wilder_rsi(closes: Sequence[float], period: int = 2) -> float:
     values = _numeric_array(closes, "RSI closes")
     if (values <= 0).any():
         raise StrategyDataError("RSI closes must be positive")
-    changes = np.diff(values)
-    average_gain = _wilder_last(np.maximum(changes, 0.0), period)
-    average_loss = _wilder_last(np.maximum(-changes, 0.0), period)
+    average_gain, average_loss = _wilder_averages(values, period)
     if average_loss == 0:
         return 100.0 if average_gain > 0 else 50.0
     return 100.0 - 100.0 / (1.0 + average_gain / average_loss)
@@ -185,6 +254,8 @@ def compute_indicators(symbol: str, daily: pd.DataFrame, current_price: float | 
         r120=float(close[-1] / close[-121] - 1.0),
         vol60=float(np.std(returns, ddof=1) * math.sqrt(TRADING_DAYS_PER_YEAR)),
         as_of=str(daily.index[-1]),
+        roll=RollState(float(close[-1]), float(np.sum(close[-4:])), float(np.sum(close[-199:])),
+                       *_wilder_averages(close, 2)),
     )
 
 
@@ -239,15 +310,16 @@ def swing_exit_reasons(indicator: Indicators, entry_price: float) -> tuple[str, 
     """Return all triggered exits; the execution layer must still enforce PDT."""
     if not math.isfinite(float(entry_price)) or float(entry_price) <= 0:
         raise StrategyDataError(f"{indicator.symbol}: entry price must be finite and positive")
-    price = require_current_price(indicator)
+    signal = swing_signal(indicator)
+    price = signal.price
     reasons = []
-    if price > indicator.sma5:
+    if price > signal.sma5:
         reasons.append("PRICE_ABOVE_SMA5")
-    if indicator.rsi2 > 70:
+    if signal.rsi2 > 70:
         reasons.append("RSI2_ABOVE_70")
     if price < float(entry_price) - 2.5 * indicator.atr14:
         reasons.append("CATASTROPHE_ATR_STOP")
-    if price < indicator.sma200:
+    if price < signal.sma200:
         reasons.append("PRICE_BELOW_SMA200")
     return tuple(reasons)
 
@@ -276,7 +348,7 @@ def swing_entries(
 
     Pass actual holdings AFTER confirmed exits as occupied_symbols. Protected
     or unfilled exits still occupy slots. Excluded symbols can include today's
-    exits to prevent a churn/reentry loop. No entry uses RSI from an open bar.
+    exits to prevent a churn/reentry loop. RSI includes today's validated quote.
     """
     if not isinstance(max_slots, int) or isinstance(max_slots, bool) or not 0 <= max_slots <= 2:
         raise StrategyDataError("Swing allocation supports between zero and two slots")
@@ -288,11 +360,10 @@ def swing_entries(
         return []
     _require(indicators, universe)
     excluded = occupied | set(excluded_symbols)
-    candidates = [
-        symbol for symbol in universe
-        if symbol not in excluded
-        and indicators[symbol].rsi2 < 10
-        and require_current_price(indicators[symbol]) > indicators[symbol].sma200
-    ]
-    candidates.sort(key=lambda symbol: indicators[symbol].rsi2)
+    # A symbol without a validated quote has no same-session signal: it is
+    # skipped, never judged from yesterday's reading. Fixtures without roll
+    # state keep the strict "quote required for a qualifying RSI" behavior.
+    candidates = [symbol for symbol in universe
+                  if symbol not in excluded and entry_candidate(indicators[symbol])]
+    candidates.sort(key=lambda symbol: swing_signal(indicators[symbol]).rsi2)
     return candidates[:free_slots]

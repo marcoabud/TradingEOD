@@ -175,17 +175,24 @@ class RecoveryExecutionTests(unittest.TestCase):
         self.interrupt_friday()
         self.monday()
         self.broker.activities[0]["qty"] = "13"
-        with self.assertRaisesRegex(SafetyError, "disagree"):
-            self.evaluate()
-        self.assertEqual(len(self.broker.executed), 2)
+        self.assert_exits_only("disagree")
 
     def test_unexpected_core_holding_blocks_recovery(self):
         self.interrupt_friday()
         self.monday()
         self.broker.holdings["GLD"] = position("GLD", 1)
-        with self.assertRaisesRegex(SafetyError, "positions do not reconcile"):
-            self.evaluate()
-        self.assertEqual(len(self.broker.executed), 2)
+        self.assert_exits_only("positions do not reconcile")
+
+    def assert_exits_only(self, reason):
+        """Uncertain core state blocks core orders and all buys, never a swing exit."""
+        summary = self.evaluate()
+        self.assertEqual(summary["core_recovery"]["status"], "blocked")
+        self.assertRegex(summary["core_recovery"]["reason"], reason)
+        self.assertEqual(summary["status"], "degraded")
+        self.assertTrue(summary["exits_only"] and summary["buy_blocked"])
+        self.assertEqual(summary["regime"], "CORE_BLOCKED")
+        self.assertEqual([(o["symbol"], o["side"]) for o in self.broker.executed[2:]], [("COST", "sell")])
+        self.assertIsNotNone(self.store.pending(MONDAY.date()))
 
     def test_after_window_never_reads_pending_intent_or_orders(self):
         self.interrupt_friday()

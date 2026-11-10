@@ -58,10 +58,16 @@ def quote_price(quote, now, symbol):
 
 
 class MarketData:
-    def __init__(self, key, secret, feed="sip", *, quote_transport=None):
+    def __init__(self, key, secret, feed="sip", *, quote_transport=None, history_feed=None):
         if feed not in ("sip", "iex"):
             raise SafetyError("ALPACA_DATA_FEED must be sip or iex")
+        if history_feed not in (None, "sip", "iex"):
+            raise SafetyError("ALPACA_HISTORY_FEED must be sip or iex")
         self.feed = DataFeed(feed)
+        # Completed daily bars end before today, so consolidated SIP history is
+        # older than the 15-minute entitlement boundary even on a basic plan.
+        # Single-venue IEX closes/ranges are not the official daily bars.
+        self.history_feed = DataFeed(history_feed or feed)
         self.client = bound_client(StockHistoricalDataClient(key, secret))
         self.quote_transport = (quote_transport if quote_transport is not None
                                 else LatestQuoteTransport(key, secret))
@@ -103,7 +109,7 @@ class MarketData:
         response = self.client.get_stock_bars(StockBarsRequest(
             symbol_or_symbols=list(symbols), timeframe=TimeFrame.Day,
             start=midnight(dates[0]), end=midnight(window.day),
-            adjustment=Adjustment.ALL, feed=self.feed, asof=window.day.isoformat()))
+            adjustment=Adjustment.ALL, feed=self.history_feed, asof=window.day.isoformat()))
         frame = response.df
         if frame.empty or not isinstance(frame.index, pd.MultiIndex):
             raise SafetyError("Historical bars missing")

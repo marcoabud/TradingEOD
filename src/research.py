@@ -7,7 +7,7 @@ replay. Runtime trading deliberately does not import this module.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 import hashlib
@@ -211,14 +211,26 @@ def load_dataset(folder: Path) -> Dataset:
     return Dataset(manifest, tuple(session_list), bars, marks, targets, frozenset(weekly))
 
 
-def prepare_signals(dataset: Dataset):
-    """Use exactly 250 preceding complete bars; today's daily OHLC never enters."""
+SIGNAL_TIMINGS = ("same_session", "lagged")
+
+
+def prepare_signals(dataset: Dataset, signal_timing: str = "same_session"):
+    """Use exactly 250 preceding complete bars; today's daily OHLC never enters.
+
+    same_session (runtime behavior): the day's mark is the provisional close
+    for swing RSI2/SMA5/SMA200. lagged: swing signals end at the previous
+    completed close, the pre-fix behavior, kept only for comparison.
+    """
+    if signal_timing not in SIGNAL_TIMINGS:
+        raise ResearchError("Unknown signal timing")
     result = {}
     for index in range(WARMUP, len(dataset.sessions)):
         day = dataset.sessions[index]
         result[day] = {symbol: compute_indicators(
             symbol, dataset.bars[symbol].iloc[index-WARMUP:index], dataset.marks[day][symbol],
         ) for symbol in UNIVERSE}
+        if signal_timing == "lagged":
+            result[day] = {s: replace(i, roll=None) for s, i in result[day].items()}
     return result
 
 
@@ -444,14 +456,14 @@ LIMITATIONS = [
 ]
 
 
-def compare(dataset: Dataset, costs=(1., 5., 10.), initial_equity=4000.):
+def compare(dataset: Dataset, costs=(1., 5., 10.), initial_equity=4000., signal_timing="same_session"):
     if not costs or len(set(costs)) != len(costs):
         raise ResearchError("Provide distinct transaction cost scenarios")
     count = len(dataset.sessions)-WARMUP
     split = int(count*.60)
     if split < 60 or count-split < 60:
         raise ResearchError("Need at least 60 development and 60 out-of-sample sessions after warmup")
-    signals = prepare_signals(dataset)
+    signals = prepare_signals(dataset, signal_timing)
     runs, comparison = [], []
     for cost in costs:
         cost_runs = [simulate(dataset, signals, variant, cost, initial_equity) for variant in VARIANTS]
@@ -462,7 +474,8 @@ def compare(dataset: Dataset, costs=(1., 5., 10.), initial_equity=4000.):
                                    "segment": segment, **metrics(run, baseline, dataset, lo, hi)})
         runs.extend(cost_runs)
     report = {"schema_version": 1, "research_only": True, "runtime_changes": False,
-              "execution_mode": dataset.manifest["execution_mode"], "provenance": dataset.manifest,
+              "execution_mode": dataset.manifest["execution_mode"], "signal_timing": signal_timing,
+              "provenance": dataset.manifest,
               "warmup_sessions": WARMUP, "evaluation_sessions": count,
               "development_fraction": .60, "out_of_sample_start": dataset.sessions[WARMUP+split].isoformat(),
               "variants": list(VARIANTS), "cost_scenarios_bps_each_side": list(costs),
@@ -477,6 +490,7 @@ def write_results(output: Path, report, runs):
     rows = [r for r in report["comparison"] if r["segment"] == "out_of_sample"]
     lines = ["# Comparación histórica exploratoria — TradingEOD", "",
              "**Investigación únicamente. Ninguna variante se activó en el bot.**", "",
+             f"Señal swing: `{report.get('signal_timing', 'same_session')}`. "
              f"Modo de precios: `{report['execution_mode']}`. Inicio fuera de muestra: {report['out_of_sample_start']}.",
              "Los rendimientos descuentan el coste por lado indicado. Son simulados; no son fills de Alpaca.", "",
              "| Variante | Coste/lado (pb) | Retorno OOS | Caída máxima OOS | Rotación/equity | Operaciones |",
@@ -501,12 +515,13 @@ def main(argv=None):
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--initial-equity", type=float, default=4000.)
     parser.add_argument("--cost-bps", nargs="+", type=float, default=[1., 5., 10.])
+    parser.add_argument("--signal-timing", choices=SIGNAL_TIMINGS, default="same_session")
     args = parser.parse_args(argv)
     if args.output.exists():
         parser.error("Output directory already exists; choose a new destination")
     try:
         dataset = load_dataset(args.input)
-        report, runs = compare(dataset, args.cost_bps, args.initial_equity)
+        report, runs = compare(dataset, args.cost_bps, args.initial_equity, args.signal_timing)
         write_results(args.output, report, runs)
     except (ResearchError, OSError, ValueError) as exc:
         parser.exit(2, f"Research stopped: {exc}\n")

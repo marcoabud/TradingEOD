@@ -23,10 +23,15 @@ LOG = logging.getLogger("trading_eod.scheduling")
 # intended family. Earlier arrivals from any configured family are usable
 # when the broker calendar and bounded waiting policy permit them.
 WARM_HOUR_BY_TARGET_HOUR = {19: 14, 20: 15, 16: 11, 17: 12}
+# GitHub delivered this repository's schedules 5-10 hours late in November
+# 2026, after every start window. This hourly family exists only so that some
+# delayed delivery lands inside the bounded 330-minute prestart wait; it is
+# always a fallback and never raises a missed-window alert by itself.
+WIDE_FALLBACK_CRON = "47 2-13 * * 1-5"
 KNOWN_CRONS = frozenset(
     cron for target_hour, warm_hour in WARM_HOUR_BY_TARGET_HOUR.items()
     for cron in (f"45 {target_hour} * * 1-5", f"17 {warm_hour} * * 1-5")
-)
+) | {WIDE_FALLBACK_CRON}
 
 
 def _calendar_window(broker, clock):

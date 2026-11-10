@@ -485,6 +485,11 @@ class CoreRecoveryStore:
             raise StateError("Pending core intent expired; manual reconciliation required")
         return active[0] if active else None
 
+    def latest_intent_date(self):
+        """Date of the newest recorded mandate, or None; grants no action."""
+        names = self._list("intents")
+        return _day(names[-1][:-5]) if names else None
+
     def begin(self, day, decision, positions, equity, revision=None, *, started_at, signal_as_of,
               supersedes=None, origin="weekly", source_evidence=None):
         if self.dry_run:

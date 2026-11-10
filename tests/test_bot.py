@@ -26,6 +26,7 @@ def empty_core_store():
     """Legacy allocation tests isolate persistence; recovery has integration tests."""
     store = Mock()
     store.pending.return_value = None
+    store.latest_intent_date.return_value = None
     store.begin.side_effect = lambda day, *args, **kwargs: {"session_date": day.isoformat()}
     store.finish.return_value = True
     return store

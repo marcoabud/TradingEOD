@@ -9,6 +9,9 @@ on:
     # Nominal warm starts for 13:00 ET early closes; usable as bounded backups.
     - cron: '17 11 * * 1-5'
     - cron: '17 12 * * 1-5'
+    # Hourly fallback: observed deliveries arrive 5-10 hours late, so earlier
+    # triggers are needed for one to land within the 330-minute prestart wait.
+    - cron: '47 2-13 * * 1-5'
     # Normal 16:00 New York close: 15:45 EDT / EST respectively.
     - cron: '45 19 * * 1-5'
     - cron: '45 20 * * 1-5'
@@ -54,6 +57,8 @@ jobs:
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
       ALPACA_PAPER: ${{ secrets.ALPACA_PAPER }}
       ALPACA_DATA_FEED: ${{ vars.ALPACA_DATA_FEED || 'sip' }}
+      # Completed daily bars: consolidated history unless explicitly overridden.
+      ALPACA_HISTORY_FEED: ${{ vars.ALPACA_HISTORY_FEED || 'sip' }}
       WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_TRADINGEOD || secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
