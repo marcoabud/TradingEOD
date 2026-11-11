@@ -32,7 +32,6 @@ Motor EOD de Alpaca para una cuenta dedicada de aproximadamente USD 4,000. Lee e
 | `.github/workflows/ci.yml` | Pruebas sin credenciales ni acceso al broker |
 | `.github/workflows/research.yml`, `docs/RESEARCH.md` | Investigación histórica y metodología sin activar reglas |
 | `tests/` | Pruebas de indicadores, ejecución, estado, calendario y notificaciones |
-| `setup_and_push.sh` | Instalador autocontenido y publicación Git sin force-push |
 
 ## Conciliación y recuperación del core
 
@@ -54,17 +53,7 @@ La primera comparación usa precios ajustados de cierre como aproximación: no r
 
 ## Despliegue en GitHub
 
-Requisitos operativos: Git, Bash y Python 3.12 o superior. En Windows sirve **Git Bash**; PowerShell no interpreta scripts `.sh`. Git debe estar autenticado en GitHub con permiso de escritura en el repositorio y de actualización de workflows. La identidad del commit debe estar configurada (`git config user.name` y `git config user.email`). No pegues tokens en el script.
-
-Descarga `setup_and_push.sh` y, desde una carpeta donde puedas crear un checkout nuevo, ejecuta:
-
-```bash
-bash setup_and_push.sh TradingEOD
-```
-
-El único archivo contiene el proyecto completo: crea el directorio, inicializa Git, agrega `https://github.com/marcoabud/TradingEOD.git`, conserva la historia remota existente de `main`, escribe los archivos, crea un commit si hay cambios y hace `git push -u origin main`. Rechaza directorios locales no vacíos y no hace force-push. El script no instala credenciales ni ejecuta el bot. Si una regla de protección impide el push, conserva el checkout para revisión mediante PR.
-
-Para extraer sin publicar: `bash setup_and_push.sh --extract-only TradingEOD-local`.
+El repositorio Git es la única fuente del código: los cambios llegan por commits o pull requests a `main`. El antiguo instalador autocontenido (`setup_and_push.sh`) se retiró porque contenía una copia completa del proyecto que quedaba desactualizada y podía sobrescribir versiones nuevas.
 
 ### Repository Secrets exactos
 
@@ -84,7 +73,8 @@ Variables de repositorio (pestaña **Variables**, no Secrets):
 | Nombre | Valor / efecto |
 |---|---|
 | `TRADING_ENABLED` | Ausente o distinto de `true`: las ejecuciones programadas solo simulan. `true`: permite enviar órdenes al entorno indicado por `ALPACA_PAPER` |
-| `ALPACA_DATA_FEED` | `sip` por defecto; requiere acceso a datos SIP recientes. `iex` permite el feed IEX si está habilitado en tu cuenta |
+| `ALPACA_DATA_FEED` | Feed de las **cotizaciones en vivo**. `sip` por defecto; requiere acceso a datos SIP recientes. `iex` permite el feed IEX si está habilitado en tu cuenta |
+| `ALPACA_HISTORY_FEED` | Feed de las **barras diarias completadas** que alimentan los indicadores. El workflow usa `sip` si no se define: esas barras terminan el día anterior y superan los 15 minutos de antigüedad. Define `iex` solo si tu cuenta rechaza SIP histórico (el bot se bloquearía con aviso; no hay cambio silencioso) |
 
 El acceso a SIP es independiente de usar una cuenta paper. No hay cambio silencioso a datos IEX: son una cobertura de mercado distinta y pueden cambiar las señales. Un error de permisos o un fallo general del proveedor detiene la secuencia; una cotización individual inválida activa la política de omisiones descrita abajo.
 
@@ -111,7 +101,8 @@ El workflow usa `GITHUB_TOKEN` automático con `contents: write` únicamente en 
 
 ## Decisiones cuantitativas explícitas
 
-- **Señales disponibles a la hora de operar:** a las 15:45 de Nueva York aún no existe el cierre definitivo de hoy. Se usan exactamente las **250 sesiones completadas anteriores**, ajustadas por splits y distribuciones (`Adjustment.ALL`), para SMA, retornos, volatilidad, RSI y ATR. El filtro core usa el cierre completado de SPY; las comparaciones de precio del swing usan el punto medio de una cotización reciente. No se trata una barra parcial como cierre final.
+- **Señales disponibles a la hora de operar:** a las 15:45 de Nueva York aún no existe el cierre definitivo de hoy. Se cargan exactamente las **250 sesiones completadas anteriores**, ajustadas por splits y distribuciones (`Adjustment.ALL`). **Swing, señal de la misma sesión:** el punto medio de la cotización validada se trata como cierre provisional de hoy para RSI2, SMA5 y SMA200, de modo que la señal y la orden pertenecen al mismo día (antes el RSI2 terminaba ayer y la compra llegaba una sesión tarde, incluso después de un rebote). Los valores de barras completadas se conservan en el resumen junto al bloque `signal` realmente evaluado. Un símbolo sin cotización válida no tiene señal hoy: se omite. **Core y ATR14** siguen terminando en la sesión completada anterior: es una decisión semanal y el máximo/mínimo de hoy no se conoce con fiabilidad.
+- **Revisión core recuperable:** si la última sesión de la semana anterior no dejó ningún mandato registrado (por ejemplo, GitHub no entregó el evento), la revisión se hace en la primera sesión posterior en lugar de esperar otra semana. Una cuenta sin ningún mandato previo empieza en su primera sesión semanal.
 - **Core, solo última sesión de la semana:** el calendario hasta el viernes determina si hoy toca rebalancear; un jueves previo a viernes feriado cuenta. Score = `(0.60 * R60 + 0.40 * R120) / sigma60`, con 60 rendimientos diarios simples y desviación estándar muestral anualizada por `sqrt(252)`. Un retorno de 60 períodos necesita 61 cierres.
 - **RISK-OFF:** SPY cerrado a/bajo SMA200, o R60 del activo con mejor score menor que R60 de SGOV → SGOV 70%. **RISK-ON:** SPY sobre SMA200 y prueba relativa aprobada → dos primeros, 35% cada uno. La igualdad de SPY con SMA200 se resuelve conservadoramente en refugio; igualdad del R60 con SGOV pasa. Empates de score siguen el orden SPY, QQQ, SMH, GLD.
 - **Tolerancia:** menos de **3 puntos porcentuales del equity total**, no 3% relativo del objetivo. También puede quedar una posición residual menor al 3% con objetivo cero. Los residuos consumen presupuesto core; no se ignoran para nuevas compras.
@@ -121,9 +112,11 @@ El workflow usa `GITHUB_TOKEN` automático con `contents: write` únicamente en 
 
 ## Horario y mercado
 
+**Retrasos observados:** en noviembre de 2026 GitHub entregó los cron de este repositorio entre 5 y 10 horas tarde; el 9 de noviembre ninguno llegó antes del cierre. Por eso existe además la familia horaria `47 2-13 * * 1-5`: solo sirve para que alguna entrega retrasada caiga dentro de la espera de 330 minutos, siempre actúa como respaldo y nunca genera por sí sola un aviso de ventana perdida. Sigue siendo best effort; un disparador externo que invoque `workflow_dispatch` es la opción robusta.
+
 Los cron solicitados son `45 19 * * 1-5` y `45 20 * * 1-5` (UTC). Se agregan `45 16 * * 1-5` y `45 17 * * 1-5` para las sesiones que cierran a las 13:00 de Nueva York.
 
-Para reducir el efecto de los retrasos de GitHub se agregan arranques anticipados: `17 14 * * 1-5` / `17 15 * * 1-5` para cierre normal EDT/EST y `17 11 * * 1-5` / `17 12 * * 1-5` para cierre anticipado. Estas son sus familias nominales: cualquiera de los ocho cron conocidos que llegue dentro de los 330 minutos anteriores al objetivo, o dentro de la ventana de inicio válida, puede servir de respaldo. Calendar y Clock determinan el horario real; la etiqueta del cron no autoriza operar antes o después. Un cron desconocido, una fecha sin sesión o un disparo programado demasiado temprano sale sin operar. La familia principal arranca nominalmente 328 minutos antes; el proceso consulta Clock a intervalos de hasta un minuto y revalida Calendar antes de continuar. El límite de espera sigue siendo 330 minutos y el job tiene un máximo de 360 minutos. Esto mantiene un runner ocupado varias horas por sesión; hay que revisar los minutos/costos de Actions antes de cambiar a un repositorio privado o un runner de pago.
+Para reducir el efecto de los retrasos de GitHub se agregan arranques anticipados: `17 14 * * 1-5` / `17 15 * * 1-5` para cierre normal EDT/EST y `17 11 * * 1-5` / `17 12 * * 1-5` para cierre anticipado. Estas son sus familias nominales: cualquiera de los cron conocidos que llegue dentro de los 330 minutos anteriores al objetivo, o dentro de la ventana de inicio válida, puede servir de respaldo. Calendar y Clock determinan el horario real; la etiqueta del cron no autoriza operar antes o después. Un cron desconocido, una fecha sin sesión o un disparo programado demasiado temprano sale sin operar. La familia principal arranca nominalmente 328 minutos antes; el proceso consulta Clock a intervalos de hasta un minuto y revalida Calendar antes de continuar. El límite de espera sigue siendo 330 minutos y el job tiene un máximo de 360 minutos. Esto mantiene un runner ocupado varias horas por sesión; hay que revisar los minutos/costos de Actions antes de cambiar a un repositorio privado o un runner de pago.
 
 Python consulta Clock y Calendar antes de la lógica de cartera. Solo admite inicio entre **cierre−15 y cierre−10 minutos**, y nuevas órdenes antes de **cierre−5 minutos**. En un día normal: inicio 15:45–15:49:59 ET; en cierre anticipado: 12:45–12:49:59 ET. La tolerancia de cinco minutos reconoce retrasos del programador; nunca convierte una ejecución tardía en una orden fuera del horario permitido.
 
@@ -157,15 +150,16 @@ Si el runner ya espera, unos cinco minutos antes realiza un preflight de solo le
 
 | Fallo | Resultado |
 |---|---|
-| Cotización de un candidato swing | Reserva su posible slot y presupuesto; no asciende otro candidato para sustituirlo. Un segundo candidato independiente puede operar. |
-| Precio válido demuestra que un candidato pierde SMA200 | Lo descarta y puede evaluar el siguiente del ranking RSI. |
+| Cotización de un símbolo swing durante el barrido de candidatos | Sin cotización no hay señal de hoy: se registra y se omite, sin reservar slot. El barrido usa un intento y un presupuesto propio de ocho segundos para no agotar el de las órdenes. |
+| Cotización de un candidato ya elegido que falla al refrescar antes de comprar | Reserva su slot y presupuesto; no asciende otro candidato para sustituirlo. |
+| Estado del core no conciliable (órdenes, fills o posiciones que no cuadran, estado ilegible) | Sesión de **solo salidas**: se ejecutan las ventas swing que correspondan; no se envía ninguna orden core ni ninguna compra. El mandato sigue pendiente y se avisa. |
 | Cotización de una posición existente | Puede salir otra posición válida; bloquea compras nuevas durante esa ejecución. |
 | Cotización de una posición o destino core | Congela el grupo antes de su primera venta; un swing independiente puede continuar si la cartera es valorable. |
 | Fallo tras comenzar órdenes core | Informa core incompleto; las órdenes no son atómicas y puede quedar efectivo. |
 | Permisos, transporte agotado, cuenta, calendario o historial anti-PDT no verificables | Detiene la secuencia. |
 | Orden parcial, rechazada o incierta | Detiene y exige conciliación; no se trata como una omisión de cotizaciones. |
 
-El ranking RSI se fija antes de las órdenes. Tras una omisión no se introduce un reemplazo ni se cambia de fuente. Todas las ventas deben confirmarse y conciliarse antes de comprar. La reserva diaria cubre también una sesión sin órdenes, y no se libera para reintentar un plan parcial.
+El conjunto de candidatos y sus exclusiones se fija antes de las órdenes; el orden por RSI2 se decide con las cotizaciones del barrido posterior a las ventas. Tras una omisión no se introduce un reemplazo ni se cambia de fuente. Todas las ventas deben confirmarse y conciliarse antes de comprar. La reserva diaria cubre también una sesión sin órdenes, y no se libera para reintentar un plan parcial.
 
 ## Observación paper
 

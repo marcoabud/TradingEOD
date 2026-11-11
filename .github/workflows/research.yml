@@ -38,6 +38,8 @@ jobs:
         run: python -m src.research_data --start 2020-08-04 --end 2026-10-30 --output research_data
       - name: Compare fixed variants without broker credentials
         run: python -m src.research --input research_data --output research_results --initial-equity 4000 --cost-bps 1 5 10
+      - name: Repeat with the previous one-session-lagged swing signal for comparison
+        run: python -m src.research --input research_data --output research_results_lagged --initial-equity 4000 --cost-bps 1 5 10 --signal-timing lagged
       - name: Preserve research evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -46,5 +48,6 @@ jobs:
           path: |
             research_data
             research_results
+            research_results_lagged
           if-no-files-found: warn
           retention-days: 90

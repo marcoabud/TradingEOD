@@ -26,7 +26,7 @@ class HistoricalQuotes:
         self.indicators = {s: replace(i, price=None) for s, i in indicators.items()}
         self.rows, self.reference, self.result = rows, reference, result
 
-    def fetch(self, symbols, phase):
+    def fetch(self, symbols, phase, *, budget=None):
         failed = set()
         for symbol in symbols:
             if symbol not in self.result["required_quotes"]:
