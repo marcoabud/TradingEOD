@@ -73,10 +73,12 @@ Variables de repositorio (pestaña **Variables**, no Secrets):
 | Nombre | Valor / efecto |
 |---|---|
 | `TRADING_ENABLED` | Ausente o distinto de `true`: las ejecuciones programadas solo simulan. `true`: permite enviar órdenes al entorno indicado por `ALPACA_PAPER` |
-| `ALPACA_DATA_FEED` | Feed de las **cotizaciones en vivo**. `sip` por defecto; requiere acceso a datos SIP recientes. `iex` permite el feed IEX si está habilitado en tu cuenta |
+| `ALPACA_DATA_FEED` | Feed de las **cotizaciones** que deciden las órdenes. `sip` por defecto; requiere acceso a datos SIP recientes. `iex` usa solo la bolsa IEX. `delayed_sip` usa el mercado consolidado completo con **15 minutos de retraso**, disponible sin suscripción de tiempo real |
 | `ALPACA_HISTORY_FEED` | Feed de las **barras diarias completadas** que alimentan los indicadores. El workflow usa `sip` si no se define: esas barras terminan el día anterior y superan los 15 minutos de antigüedad. Define `iex` solo si tu cuenta rechaza SIP histórico (el bot se bloquearía con aviso; no hay cambio silencioso) |
 
 El acceso a SIP es independiente de usar una cuenta paper. No hay cambio silencioso a datos IEX: son una cobertura de mercado distinta y pueden cambiar las señales. Un error de permisos o un fallo general del proveedor detiene la secuencia; una cotización individual inválida activa la política de omisiones descrita abajo.
+
+**`delayed_sip`:** a cierre−15 min el bot decide con la cotización consolidada de cierre−30 min. Se exige que la cotización tenga entre 14 y 16.5 minutos de antigüedad (el retraso fijo más el margen habitual de 90 segundos) y se aplican las mismas reglas de spread y tamaños. Las órdenes siguen siendo a mercado: las compras por importe y las ventas por cantidad se ejecutan al precio real del momento, que puede diferir del precio observado. La valoración de cartera, el tamaño de las ventas parciales del core y el stop ATR usan también ese precio retrasado. Con este feed, las barras diarias usan `sip` salvo que `ALPACA_HISTORY_FEED` indique otra cosa.
 
 IEX representa una sola bolsa. En la reconstrucción del 21 de octubre de 2026, SGOV superó los 90 segundos de antigüedad, y LLY, JPM y BRK.B superaron el spread permitido. El acceso a latest SIP devolvió HTTP 403. El bot exige una cotización válida cuando el activo interviene en una decisión o está en cartera; no relaja estas reglas para compensar un feed insuficiente. Tras agotar la recuperación de un símbolo, omite las órdenes dependientes y conserva las decisiones independientes que todavía pueden justificarse.
 

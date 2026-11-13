@@ -79,7 +79,7 @@ class QuoteSession:
             _, _, diag = inspect_quote(self.quotes.get(symbol), now, feed=self.summary["feed"])
             diagnostics[symbol] = dict(diag, checked_at=now.isoformat(), attempts=0, recovered=False)
             try:
-                quote_price(self.quotes.get(symbol), now, symbol)
+                quote_price(self.quotes.get(symbol), now, symbol, self.summary["feed"])
             except SafetyError:
                 self.issue(symbol, phase, "quote_expired_before_submission" if phase == "pre_submit"
                            else "quote_expired_before_completion")

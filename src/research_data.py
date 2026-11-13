@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import time
 
 import pandas as pd
 import numpy as np
@@ -18,7 +19,7 @@ import requests
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from .data import validate_bars
 from .safety import NY, SafetyError, midnight, session_time
@@ -120,8 +121,80 @@ def export_dataset(start, end, output, *, client, calendar_rows, retrieved_at=No
     return manifest
 
 
+def intraday_marks(frame, day, opens, closes, daily_close):
+    """Reference prices at close-30min (signal) and close-15min (execution).
+
+    A 15-minute bar starting exactly at the reference time gives its open (the
+    first consolidated trade of that interval). Without one, the close of the
+    latest earlier regular-session bar that day is used; with no intraday bar
+    at all, the validated daily close. Both substitutions are counted.
+    """
+    result, kinds = [], []
+    session = frame[(frame.index >= opens) & (frame.index < closes)] if frame is not None else None
+    for minutes in (30, 15):
+        at = closes - timedelta(minutes=minutes)
+        exact = session[session.index == at] if session is not None else None
+        earlier = session[session.index < at] if session is not None else None
+        if exact is not None and len(exact):
+            price, kind = float(exact["open"].iloc[0]), "exact"
+        elif earlier is not None and len(earlier):
+            price, kind = float(earlier["close"].iloc[-1]), "earlier_bar"
+        else:
+            price, kind = float(daily_close), "daily_close"
+        if not np.isfinite(price) or price <= 0:
+            raise SafetyError(f"Invalid intraday reference price: {day}")
+        result.append(price)
+        kinds.append(kind)
+    return result, kinds
+
+
+def export_intraday(output, *, client, calendar_rows, end, pause=time.sleep):
+    """Add intraday.csv to an exported dataset: same feed, adjustment and asof."""
+    daily = pd.read_csv(output/"daily.csv")
+    rows = sorted(calendar_rows, key=lambda r: r["date"])
+    days = [date.fromisoformat(r["date"]) for r in rows]
+    bounds = {d: (session_time(r["open"], d), session_time(r["close"], d)) for r, d in zip(rows, days)}
+    closes = {(r.symbol, r.date): r.close for r in daily.itertuples(index=False)}
+    records, counts = [], {"exact": 0, "earlier_bar": 0, "daily_close": 0}
+    # Quarterly requests bound memory; the SDK follows pagination inside each.
+    cursor = days[0]
+    while cursor <= days[-1]:
+        stop = min(days[-1], cursor+timedelta(days=90))
+        frame = client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=list(SYMBOLS), timeframe=TimeFrame(15, TimeFrameUnit.Minute),
+            start=midnight(cursor), end=midnight(stop+timedelta(days=1))-timedelta(microseconds=1),
+            adjustment=Adjustment.ALL, feed=DataFeed.SIP, asof=end.isoformat(),
+        )).df
+        present = set(frame.index.get_level_values("symbol")) if len(frame) else set()
+        for symbol in SYMBOLS:
+            bars = frame.xs(symbol, level="symbol") if symbol in present else None
+            if bars is not None:
+                bars = bars.copy()
+                bars.index = bars.index.tz_convert(NY)
+            for day in (d for d in days if cursor <= d <= stop):
+                (signal, execution), kinds = intraday_marks(
+                    bars, day, *bounds[day], closes[(symbol, day.isoformat())])
+                for kind in kinds:
+                    counts[kind] += 1
+                records.append({"date": day.isoformat(), "symbol": symbol,
+                                "signal_price": signal, "execution_price": execution})
+        cursor = stop+timedelta(days=1)
+        pause(3)  # Stay well under the provider's per-minute request limit.
+    pd.DataFrame(records).sort_values(["date", "symbol"]).to_csv(output/"intraday.csv", index=False)
+    meta = {"schema_version": 1, "feed": "sip", "adjustment": "all", "bar_minutes": 15,
+            "signal_minutes_before_close": 30, "execution_minutes_before_close": 15,
+            "reference_sources": counts,
+            "sha256": hashlib.sha256((output/"intraday.csv").read_bytes()).hexdigest(),
+            "limitations": ["Bar opens are first trades of the interval, not NBBO midpoints or fills",
+                            "Substituted references are counted in reference_sources"]}
+    (output/"intraday.json").write_text(json.dumps(meta, indent=2)+"\n", encoding="utf-8")
+    return meta
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--intraday", action="store_true",
+                        help="also export close-30min and close-15min reference prices")
     parser.add_argument("--start", type=date.fromisoformat, default=date(2020, 8, 4))
     parser.add_argument("--end", type=date.fromisoformat, default=date(2026, 10, 30))
     parser.add_argument("--output", type=Path, default=Path("research_data"))
@@ -145,10 +218,13 @@ def main(argv=None):
         client._retry = 0
         try:
             manifest = export_dataset(args.start, args.end, args.output, client=client, calendar_rows=rows)
+            intraday = (export_intraday(args.output, client=client, calendar_rows=rows, end=args.end)
+                        if args.intraday else None)
         finally:
             client._session.close()
         print(json.dumps({"status": "exported", "sessions": manifest["sessions"],
-                          "symbols": len(SYMBOLS), "execution_mode": manifest["execution_mode"]}))
+                          "symbols": len(SYMBOLS), "execution_mode": manifest["execution_mode"],
+                          "intraday_reference_sources": intraday["reference_sources"] if intraday else None}))
         return 0
     except Exception as exc:
         # Provider exceptions can carry URLs/credentials. Only fixed/sanitized

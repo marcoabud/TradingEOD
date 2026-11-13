@@ -287,7 +287,7 @@ def recorded_quote(diagnostic):
         result[field] = stamp
     cause = diagnostic.get("cause")
     result["cause"] = cause if cause is None or (isinstance(cause, str) and re.fullmatch(r"[a-z_]{1,40}", cause)) else "unknown"
-    result["feed"] = diagnostic.get("feed") if diagnostic.get("feed") in ("iex", "sip") else "unknown"
+    result["feed"] = diagnostic.get("feed") if diagnostic.get("feed") in ("iex", "sip", "delayed_sip") else "unknown"
     result["recovered"] = diagnostic.get("recovered") is True
     return result
 
@@ -418,7 +418,7 @@ def observe(environ, session, *, sleeper=time.sleep, monotonic=time.monotonic):
                   weekly_rebalance=summary.get("weekly_rebalance") is True,
                   core_evaluated=(summary.get("weekly_rebalance") is True
                                   and summary.get("regime") in ("RISK_ON", "RISK_OFF", "RISK-ON", "RISK-OFF")),
-                  source_feed=summary.get("feed") if summary.get("feed") in ("iex", "sip") else "unknown")
+                  source_feed=summary.get("feed") if summary.get("feed") in ("iex", "sip", "delayed_sip") else "unknown")
     if day < start and environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
         return {**report, "reason": "Session precedes the configured observation campaign"}
     samples = samples_from_summary(summary)

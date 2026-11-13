@@ -65,6 +65,8 @@ class Dataset:
     marks: dict[date, dict[str, float]]
     targets: dict[date, datetime]
     weekly: frozenset[date]
+    # Prices observed for swing signals when they differ from execution marks.
+    signal_marks: dict[date, dict[str, float]] | None = None
 
 
 def _dates(series, label):
@@ -214,6 +216,50 @@ def load_dataset(folder: Path) -> Dataset:
 SIGNAL_TIMINGS = ("same_session", "lagged")
 
 
+INTRADAY_SOURCES = ("live", "delayed")
+
+
+def with_intraday(dataset: Dataset, folder: Path, source: str) -> Dataset:
+    """Execute at close-15min; observe signals there (live) or at close-30min.
+
+    "delayed" models the consolidated feed delayed 15 minutes: decisions at
+    close-15min see the price of close-30min, while orders fill near
+    close-15min. "live" is the same execution with an undelayed signal price.
+    """
+    if source not in INTRADAY_SOURCES:
+        raise ResearchError("Unknown intraday signal source")
+    folder = Path(folder)
+    try:
+        meta = json.loads((folder/"intraday.json").read_bytes())
+        payload = (folder/"intraday.csv").read_bytes()
+        frame = pd.read_csv(folder/"intraday.csv")
+    except (OSError, ValueError):
+        raise ResearchError("Cannot read intraday reference prices") from None
+    if (not isinstance(meta, dict) or meta.get("sha256") != hashlib.sha256(payload).hexdigest()
+            or meta.get("adjustment") != "all"
+            or meta.get("signal_minutes_before_close") != 30
+            or meta.get("execution_minutes_before_close") != 15):
+        raise ResearchError("Intraday reference file fails checksum or basis checks")
+    if not {"date", "symbol", "signal_price", "execution_price"}.issubset(frame.columns):
+        raise ResearchError("Intraday CSV missing required columns")
+    _finite_frame(frame, ("signal_price", "execution_price"), "intraday marks")
+    if (frame[["signal_price", "execution_price"]] <= 0).any().any() or frame.duplicated(["date", "symbol"]).any():
+        raise ResearchError("Invalid or duplicate intraday marks")
+    frame["date"] = _dates(frame["date"], "intraday")
+    execution = {day: {} for day in dataset.sessions}
+    signal = {day: {} for day in dataset.sessions}
+    for row in frame.itertuples(index=False):
+        if row.date not in execution or row.symbol not in UNIVERSE:
+            raise ResearchError("Intraday mark outside dataset calendar or universe")
+        execution[row.date][row.symbol] = float(row.execution_price)
+        signal[row.date][row.symbol] = float(row.signal_price if source == "delayed" else row.execution_price)
+    if any(set(v) != set(UNIVERSE) for v in execution.values()):
+        raise ResearchError("Incomplete intraday marks; no fallback is allowed")
+    manifest = {**dataset.manifest, "execution_mode": f"intraday_close_minus_15m_signal_{source}",
+                "intraday": meta}
+    return replace(dataset, manifest=manifest, marks=execution, signal_marks=signal)
+
+
 def prepare_signals(dataset: Dataset, signal_timing: str = "same_session"):
     """Use exactly 250 preceding complete bars; today's daily OHLC never enters.
 
@@ -227,7 +273,8 @@ def prepare_signals(dataset: Dataset, signal_timing: str = "same_session"):
     for index in range(WARMUP, len(dataset.sessions)):
         day = dataset.sessions[index]
         result[day] = {symbol: compute_indicators(
-            symbol, dataset.bars[symbol].iloc[index-WARMUP:index], dataset.marks[day][symbol],
+            symbol, dataset.bars[symbol].iloc[index-WARMUP:index],
+            (dataset.signal_marks or dataset.marks)[day][symbol],
         ) for symbol in UNIVERSE}
         if signal_timing == "lagged":
             result[day] = {s: replace(i, roll=None) for s, i in result[day].items()}
@@ -516,11 +563,15 @@ def main(argv=None):
     parser.add_argument("--initial-equity", type=float, default=4000.)
     parser.add_argument("--cost-bps", nargs="+", type=float, default=[1., 5., 10.])
     parser.add_argument("--signal-timing", choices=SIGNAL_TIMINGS, default="same_session")
+    parser.add_argument("--intraday", choices=INTRADAY_SOURCES, default=None,
+                        help="use intraday.csv: execute at close-15min with a live or 15-minute-delayed signal")
     args = parser.parse_args(argv)
     if args.output.exists():
         parser.error("Output directory already exists; choose a new destination")
     try:
         dataset = load_dataset(args.input)
+        if args.intraday:
+            dataset = with_intraday(dataset, args.input, args.intraday)
         report, runs = compare(dataset, args.cost_bps, args.initial_equity, args.signal_timing)
         write_results(args.output, report, runs)
     except (ResearchError, OSError, ValueError) as exc:
