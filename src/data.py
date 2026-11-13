@@ -48,10 +48,10 @@ def _quote_error(symbol, cause, age, bid, ask):
     )
 
 
-def quote_price(quote, now, symbol):
-    # Validation thresholds are identical for both feeds. This legacy helper
-    # has no feed selection or transport; the batch API carries provenance.
-    price, cause, diagnostic = inspect_quote(quote, now, feed="iex")
+def quote_price(quote, now, symbol, feed="iex"):
+    # Spread/size thresholds are identical for every feed; only the permitted
+    # age differs for the fixed-delay consolidated feed.
+    price, cause, diagnostic = inspect_quote(quote, now, feed=feed)
     if cause is not None:
         raise _quote_error(symbol, cause, diagnostic["age_seconds"], diagnostic["bid"], diagnostic["ask"])
     return price
@@ -59,15 +59,16 @@ def quote_price(quote, now, symbol):
 
 class MarketData:
     def __init__(self, key, secret, feed="sip", *, quote_transport=None, history_feed=None):
-        if feed not in ("sip", "iex"):
-            raise SafetyError("ALPACA_DATA_FEED must be sip or iex")
+        if feed not in ("sip", "iex", "delayed_sip"):
+            raise SafetyError("ALPACA_DATA_FEED must be sip, iex or delayed_sip")
         if history_feed not in (None, "sip", "iex"):
             raise SafetyError("ALPACA_HISTORY_FEED must be sip or iex")
         self.feed = DataFeed(feed)
         # Completed daily bars end before today, so consolidated SIP history is
         # older than the 15-minute entitlement boundary even on a basic plan.
         # Single-venue IEX closes/ranges are not the official daily bars.
-        self.history_feed = DataFeed(history_feed or feed)
+        # The delayed quote feed has no daily-bar counterpart: its history is sip.
+        self.history_feed = DataFeed(history_feed or ("sip" if feed == "delayed_sip" else feed))
         self.client = bound_client(StockHistoricalDataClient(key, secret))
         self.quote_transport = (quote_transport if quote_transport is not None
                                 else LatestQuoteTransport(key, secret))
@@ -86,7 +87,7 @@ class MarketData:
         now = now() if callable(now) else now
         if set(symbols) - quotes.keys():
             raise SafetyError("Missing latest quotes")
-        return {s: quote_price(quotes[s], now, s) for s in symbols}
+        return {s: quote_price(quotes[s], now, s, self.feed.value) for s in symbols}
 
     def load(self, symbols, window, broker, *, quote_symbols=None):
         """Validate all history, then attach only explicitly requested quotes.

@@ -185,7 +185,10 @@ def run(config, broker, data, summary, claim=claim_session, observe=None, core_s
     window = resolve_window(clock, broker.calendar(day, max(day, friday)))
     summary.update(session_date=day.isoformat(), mode="paper" if config.paper else "live",
                    dry_run=config.dry_run, feed=config.feed,
-                   history_feed=config.history_feed or config.feed, orders=[], planned_orders=[],
+                   history_feed=config.history_feed or
+                   ("sip" if config.feed == "delayed_sip" else config.feed),
+                   signal_price_delay_minutes=15 if config.feed == "delayed_sip" else 0,
+                   orders=[], planned_orders=[],
                    protected=[], regime="NOT_EVALUATED", status="skipped")
     if window is None:
         if summary.get("prestart_approved"):

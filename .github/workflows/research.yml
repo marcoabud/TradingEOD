@@ -16,7 +16,7 @@ jobs:
   historical-comparison:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -35,11 +35,15 @@ jobs:
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
         # SGOV has five zero-volume bars through 2020-08-03. Begin after that
         # observed data-quality boundary; never synthesize or loosen validation.
-        run: python -m src.research_data --start 2020-08-04 --end 2026-10-30 --output research_data
+        run: python -m src.research_data --start 2020-08-04 --end 2026-10-30 --output research_data --intraday
       - name: Compare fixed variants without broker credentials
         run: python -m src.research --input research_data --output research_results --initial-equity 4000 --cost-bps 1 5 10
       - name: Repeat with the previous one-session-lagged swing signal for comparison
         run: python -m src.research --input research_data --output research_results_lagged --initial-equity 4000 --cost-bps 1 5 10 --signal-timing lagged
+      - name: Execute at close-15min with a live signal price (real-time consolidated data)
+        run: python -m src.research --input research_data --output research_results_intraday_live --initial-equity 4000 --cost-bps 1 5 10 --intraday live
+      - name: Execute at close-15min with the signal price delayed 15 minutes (delayed_sip)
+        run: python -m src.research --input research_data --output research_results_intraday_delayed --initial-equity 4000 --cost-bps 1 5 10 --intraday delayed
       - name: Preserve research evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -49,5 +53,7 @@ jobs:
             research_data
             research_results
             research_results_lagged
+            research_results_intraday_live
+            research_results_intraday_delayed
           if-no-files-found: warn
           retention-days: 90

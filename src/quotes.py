@@ -23,7 +23,19 @@ from .safety import SafetyError, aware
 
 
 _SYMBOL = re.compile(r"[A-Z0-9.\-]{1,16}")
-_FEEDS = {"iex", "sip"}
+_FEEDS = {"iex", "sip", "delayed_sip"}
+# delayed_sip is the consolidated tape as it stood 15 minutes earlier: every
+# venue, available without a real-time entitlement. Its quotes are therefore
+# legitimately ~900 seconds old; the same 90-second freshness margin is applied
+# on top of that fixed delay. A fresher delayed quote than the delay allows
+# would mean the provider changed the feed's meaning, so it is rejected too.
+FEED_DELAY_SECONDS = {"iex": 0.0, "sip": 0.0, "delayed_sip": 900.0}
+MAX_QUOTE_AGE_SECONDS = 90.0
+DELAY_TOLERANCE_SECONDS = 60.0
+
+
+def max_quote_age(feed):
+    return FEED_DELAY_SECONDS[feed] + MAX_QUOTE_AGE_SECONDS
 _RETRY_AT = (0.0, 3.0, 8.0, 18.0)
 _MAX_REQUEST_SECONDS = 8.0
 _MIN_REQUEST_SECONDS = 0.05
@@ -100,8 +112,10 @@ def inspect_quote(quote, now, *, feed):
         cause = "invalid_timestamp"
     elif age < -5:
         cause = "future_timestamp"
-    elif age > 90:
+    elif age > max_quote_age(feed):
         cause = "stale"
+    elif age < FEED_DELAY_SECONDS[feed] - DELAY_TOLERANCE_SECONDS:
+        cause = "delay_not_honored"
     elif bid is None or ask is None:
         cause = "invalid_price"
     elif bid <= 0 or ask <= 0:
